@@ -11,7 +11,7 @@ A [Home Assistant](https://home-assistant.io/) custom integration that connects 
 - **Streaming** — low latency for voice pipelines (first token arrives fast)
 - **Hermes session continuity** — reuses Hermes `X-Hermes-Session-Id` sessions across short voice turns
 - **Voice-origin awareness** — can key continuity from `device_id` / `satellite_id` and pass room context into the prompt
-- **Entity exposure** — includes your smart home device states in the system prompt
+- **Entity exposure** - includes exposed entity names, aliases, domains, areas, and states in the system prompt
 - **Follow-up listening modes** — keep Assist closed, always listening, or listening only when Hermes asks a question
 - **Multi-turn** — supports both local HA-side history and Hermes-backed session reuse
 - **Username resolution** — passes the user's name to the agent
@@ -89,7 +89,7 @@ Create one Hermes Agent integration entry for each Assist agent that should use 
 
 If your installed integration version does not show the **Profile** field yet, the immediate workaround is to make the desired profile primary in the add-on, then leave the integration's profile blank. After updating to a version with profile routing, select each profile through its own integration entry and assign that entry to the desired Home Assistant Assist agent.
 
-The default system prompt includes the current date/time, timezone, the user's name, the home name, and exposed device states (if enabled). Entity exposure is off by default since Hermes Agent can access Home Assistant entities directly when a Home Assistant token is configured in the Hermes Agent add-on.
+The default system prompt includes the current date/time, timezone, the user's name, the home name, and exposed entity names, aliases, domains, areas, and states (if enabled). Entity exposure is off by default since Hermes Agent can access Home Assistant entities directly when a Home Assistant token is configured in the Hermes Agent add-on.
 
 ### Voice continuity modes
 
