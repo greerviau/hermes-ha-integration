@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from tests.test_support import FakeConfigEntry, FakeConversationInput, FakeHass
 from custom_components.hermes_conversation.api import HermesStreamSetupError
@@ -10,11 +11,14 @@ from custom_components.hermes_conversation import conversation as conversation_m
 from custom_components.hermes_conversation.conversation import HermesConversationAgent
 from custom_components.hermes_conversation.const import (
     CONF_API_KEY,
+    CONF_CONTEXT_MAX_CHARS,
     CONF_CONTINUED_CONVERSATION_MODE,
     CONF_ENABLE_CONTINUED_CONVERSATION,
     CONF_ENABLE_SESSION_REUSE,
+    CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
+    DEFAULT_PROMPT,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
     FOLLOW_UP_MODE_OFF,
@@ -354,6 +358,160 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
         rendered = agent._render_system_prompt("Chalkers")
         self.assertIn("Legacy system prompt", rendered)
+
+    def test_exposed_entities_include_alias_domain_and_device_area(self):
+        state = SimpleNamespace(
+            entity_id="light.kitchen_ceiling",
+            state="on",
+            attributes={"friendly_name": "Ceiling Light"},
+        )
+        hass = FakeHass(states=[state])
+        hass._entity_registry = SimpleNamespace(
+            async_get=lambda _entity_id: SimpleNamespace(
+                aliases={"Kitchen Main", "Ceiling"},
+                area_id=None,
+                device_id="device-1",
+            )
+        )
+        hass._device_registry = SimpleNamespace(
+            async_get=lambda _device_id: SimpleNamespace(area_id="kitchen")
+        )
+        hass._area_registry = SimpleNamespace(
+            async_get_area=lambda _area_id: SimpleNamespace(name="Kitchen")
+        )
+        entry = FakeConfigEntry(options={CONF_INCLUDE_EXPOSED_ENTITIES: True})
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        entities = agent._get_exposed_entities()
+
+        self.assertEqual(
+            entities,
+            [
+                {
+                    "entity_id": "light.kitchen_ceiling",
+                    "name": "Ceiling Light",
+                    "state": "on",
+                    "domain": "light",
+                    "aliases": ["Ceiling", "Kitchen Main"],
+                    "area": "Kitchen",
+                }
+            ],
+        )
+
+    def test_exposed_entity_area_overrides_device_area(self):
+        state = SimpleNamespace(
+            entity_id="light.kitchen_ceiling",
+            state="on",
+            attributes={"friendly_name": "Ceiling Light"},
+        )
+        hass = FakeHass(states=[state])
+        hass._entity_registry = SimpleNamespace(
+            async_get=lambda _entity_id: SimpleNamespace(
+                aliases=[],
+                area_id="kitchen",
+                device_id="device-1",
+            )
+        )
+        hass._device_registry = SimpleNamespace(
+            async_get=lambda _device_id: self.fail(
+                "device area must not replace an entity area"
+            )
+        )
+        hass._area_registry = SimpleNamespace(
+            async_get_area=lambda _area_id: SimpleNamespace(name="Kitchen")
+        )
+        entry = FakeConfigEntry(options={CONF_INCLUDE_EXPOSED_ENTITIES: True})
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        self.assertEqual(agent._get_exposed_entities()[0]["area"], "Kitchen")
+
+    def test_exposed_entity_survives_missing_registry_metadata(self):
+        state = SimpleNamespace(
+            entity_id="light.kitchen_ceiling",
+            state="on",
+            attributes={"friendly_name": "Ceiling Light"},
+        )
+        hass = FakeHass(states=[state])
+        entry = FakeConfigEntry(options={CONF_INCLUDE_EXPOSED_ENTITIES: True})
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        self.assertEqual(
+            agent._get_exposed_entities(),
+            [
+                {
+                    "entity_id": "light.kitchen_ceiling",
+                    "name": "Ceiling Light",
+                    "state": "on",
+                    "domain": "light",
+                    "aliases": [],
+                    "area": "",
+                }
+            ],
+        )
+
+    def test_exposed_entity_budget_counts_alias_domain_and_area(self):
+        state = SimpleNamespace(
+            entity_id="light.kitchen_ceiling",
+            state="on",
+            attributes={"friendly_name": "Ceiling Light"},
+        )
+        hass = FakeHass(states=[state])
+        hass._entity_registry = SimpleNamespace(
+            async_get=lambda _entity_id: SimpleNamespace(
+                aliases={"Kitchen Main", "Ceiling"},
+                area_id="kitchen",
+                device_id=None,
+            )
+        )
+        hass._area_registry = SimpleNamespace(
+            async_get_area=lambda _area_id: SimpleNamespace(name="Kitchen")
+        )
+        entry = FakeConfigEntry(
+            options={
+                CONF_INCLUDE_EXPOSED_ENTITIES: True,
+                CONF_CONTEXT_MAX_CHARS: 70,
+            }
+        )
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        self.assertEqual(agent._get_exposed_entities(), [])
+
+    def test_exposed_entities_resolve_modern_computed_aliases(self):
+        computed_name = object()
+        registry_entry = SimpleNamespace(
+            aliases=[computed_name, "Kitchen Main"],
+            area_id=None,
+            device_id=None,
+        )
+        state = SimpleNamespace(
+            entity_id="light.kitchen_ceiling",
+            state="on",
+            attributes={"friendly_name": "Ceiling Light"},
+        )
+        hass = FakeHass(states=[state])
+        hass._entity_registry = SimpleNamespace(
+            async_get=lambda _entity_id: registry_entry
+        )
+        entry = FakeConfigEntry(options={CONF_INCLUDE_EXPOSED_ENTITIES: True})
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        with mock.patch.object(
+            conversation_module.er,
+            "async_get_entity_aliases",
+            create=True,
+            return_value=["Kitchen Main", "Ceiling Light"],
+        ) as get_aliases:
+            entities = agent._get_exposed_entities()
+
+        get_aliases.assert_called_once_with(hass, registry_entry)
+        self.assertEqual(
+            entities[0]["aliases"], ["Ceiling Light", "Kitchen Main"]
+        )
+
+    def test_default_prompt_renders_extended_entity_context(self):
+        self.assertIn("entity.domain", DEFAULT_PROMPT)
+        self.assertIn("entity.aliases", DEFAULT_PROMPT)
+        self.assertIn("entity.area", DEFAULT_PROMPT)
 
     async def test_entity_streams_safe_deltas_to_chat_log(self):
         entry = FakeConfigEntry(

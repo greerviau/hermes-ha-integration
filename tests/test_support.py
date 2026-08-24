@@ -232,6 +232,7 @@ class FakeHass:
         self.states = FakeStates(states)
         self.data = {}
         self.config_entries = FakeConfigEntries(self)
+        self._entity_registry = SimpleNamespace(async_get=lambda entity_id: None)
         self._device_registry = SimpleNamespace(async_get=lambda device_id: None)
         self._area_registry = SimpleNamespace(async_get_area=lambda area_id: None)
 
@@ -341,6 +342,9 @@ def install_stubs():
     area_registry = types.ModuleType("homeassistant.helpers.area_registry")
     area_registry.async_get = lambda hass: hass._area_registry
 
+    entity_registry = types.ModuleType("homeassistant.helpers.entity_registry")
+    entity_registry.async_get = lambda hass: hass._entity_registry
+
     device_registry = types.ModuleType("homeassistant.helpers.device_registry")
     device_registry.async_get = lambda hass: hass._device_registry
 
@@ -361,6 +365,7 @@ def install_stubs():
     helpers.intent = intent
     helpers.template = template
     helpers.area_registry = area_registry
+    helpers.entity_registry = entity_registry
     helpers.device_registry = device_registry
     helpers.aiohttp_client = aiohttp_client
     helpers.chat_session = chat_session
@@ -390,6 +395,7 @@ def install_stubs():
     sys.modules["homeassistant.helpers.intent"] = intent
     sys.modules["homeassistant.helpers.template"] = template
     sys.modules["homeassistant.helpers.area_registry"] = area_registry
+    sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
     sys.modules["homeassistant.helpers.device_registry"] = device_registry
     sys.modules["homeassistant.helpers.aiohttp_client"] = aiohttp_client
     sys.modules["homeassistant.helpers.chat_session"] = chat_session
