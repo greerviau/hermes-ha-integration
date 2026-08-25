@@ -30,6 +30,7 @@ from .compat import (
     entry_value,
     normalize_host,
     normalize_profile,
+    normalize_profile_route,
     resolve_connection_config,
     resolve_continued_conversation_mode,
 )
@@ -46,6 +47,7 @@ from .const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PORT,
     CONF_PROFILE,
+    CONF_PROFILE_ROUTE,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
     CONF_USE_SSL,
@@ -57,6 +59,7 @@ from .const import (
     DEFAULT_FALLBACK_MEDIA_PLAYER,
     DEFAULT_FALLBACK_TTS_ENGINE,
     DEFAULT_PORT,
+    DEFAULT_PROFILE_ROUTE,
     DEFAULT_PROMPT,
     DEFAULT_SESSION_TIMEOUT_SECONDS,
     DOMAIN,
@@ -64,6 +67,7 @@ from .const import (
     FOLLOW_UP_MODE_AUTO,
     FOLLOW_UP_MODE_OFF,
     LEGACY_CONF_INSTRUCTIONS,
+    ProfileRouteFamily,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +77,17 @@ _FOLLOW_UP_MODE_OPTIONS = [
     SelectOptionDict(value=FOLLOW_UP_MODE_OFF, label="Off"),
     SelectOptionDict(value=FOLLOW_UP_MODE_ALWAYS, label="Always"),
     SelectOptionDict(value=FOLLOW_UP_MODE_AUTO, label="Auto when Hermes asks a question"),
+]
+
+_PROFILE_ROUTE_OPTIONS = [
+    SelectOptionDict(
+        value=ProfileRouteFamily.ADDON.value,
+        label="Home Assistant add-on (/profile/<name>)",
+    ),
+    SelectOptionDict(
+        value=ProfileRouteFamily.NATIVE.value,
+        label="Native Hermes multiplexer (/p/<name>)",
+    ),
 ]
 
 
@@ -97,13 +112,21 @@ def _connection_identity(
     port: int,
     use_ssl: bool,
     profile: str,
-) -> tuple[str, int, bool, str]:
+    profile_route: ProfileRouteFamily | str | None,
+) -> tuple[str, int, bool, str, str]:
     """Return the normalized fields that identify one API endpoint."""
+    normalized_route = normalize_profile_route(profile_route)
+    normalized_profile = normalize_profile(profile, normalized_route)
+    root_profile = not normalized_profile or (
+        normalized_route is ProfileRouteFamily.NATIVE
+        and normalized_profile == "default"
+    )
     return (
         normalize_host(host),
         int(port),
         bool(use_ssl),
-        normalize_profile(profile),
+        "" if root_profile else normalized_route.value,
+        "" if root_profile else normalized_profile,
     )
 
 
@@ -113,11 +136,18 @@ def _connection_is_configured(
     port: int,
     use_ssl: bool,
     profile: str,
+    profile_route: ProfileRouteFamily | str | None,
     *,
     exclude_entry_id: str | None = None,
 ) -> bool:
     """Return whether another entry already owns this API endpoint."""
-    identity = _connection_identity(host, port, use_ssl, profile)
+    identity = _connection_identity(
+        host,
+        port,
+        use_ssl,
+        profile,
+        profile_route,
+    )
     for entry in entries:
         if entry.entry_id == exclude_entry_id:
             continue
@@ -127,6 +157,7 @@ def _connection_is_configured(
             connection.port,
             connection.use_ssl,
             connection.profile,
+            connection.profile_route,
         ):
             return True
     return False
@@ -149,6 +180,7 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
         port: int,
         use_ssl: bool,
         profile: str,
+        profile_route: ProfileRouteFamily | str | None,
     ) -> None:
         """Abort if the same transport endpoint and profile already exists."""
         if _connection_is_configured(
@@ -157,6 +189,7 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
             port,
             use_ssl,
             profile,
+            profile_route,
         ):
             raise AbortFlow("already_configured")
 
@@ -169,14 +202,25 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             host = ""
             profile = ""
+            profile_route = DEFAULT_PROFILE_ROUTE
             try:
                 host = normalize_host(user_input[CONF_HOST])
             except ValueError:
                 errors[CONF_HOST] = "invalid_host"
             try:
-                profile = normalize_profile(user_input.get(CONF_PROFILE, ""))
+                profile_route = normalize_profile_route(
+                    user_input.get(CONF_PROFILE_ROUTE)
+                )
             except ValueError:
-                errors[CONF_PROFILE] = "invalid_profile"
+                errors[CONF_PROFILE_ROUTE] = "invalid_profile_route"
+            if CONF_PROFILE_ROUTE not in errors:
+                try:
+                    profile = normalize_profile(
+                        user_input.get(CONF_PROFILE, ""),
+                        profile_route,
+                    )
+                except ValueError:
+                    errors[CONF_PROFILE] = "invalid_profile"
 
             if not errors:
                 port = user_input[CONF_PORT]
@@ -192,6 +236,7 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
                     use_ssl=use_ssl,
                     verify_ssl=verify_ssl,
                     profile=profile,
+                    profile_route=profile_route,
                 )
 
                 try:
@@ -201,6 +246,7 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
                         port,
                         use_ssl,
                         profile,
+                        profile_route,
                     )
                     return self.async_create_entry(
                         title=_entry_title(profile),
@@ -209,6 +255,7 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
                             CONF_PORT: port,
                             CONF_API_KEY: api_key or "",
                             CONF_PROFILE: profile,
+                            CONF_PROFILE_ROUTE: profile_route.value,
                             CONF_USE_SSL: use_ssl,
                             CONF_VERIFY_SSL: verify_ssl,
                         },
@@ -232,6 +279,12 @@ class HermesConversationConfigFlow(ConfigFlow, domain=DOMAIN):
                     vol.Required(CONF_HOST, default="homeassistant.local"): str,
                     vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
                     vol.Optional(CONF_PROFILE, default=""): str,
+                    vol.Required(
+                        CONF_PROFILE_ROUTE,
+                        default=DEFAULT_PROFILE_ROUTE.value,
+                    ): SelectSelector(
+                        SelectSelectorConfig(options=_PROFILE_ROUTE_OPTIONS)
+                    ),
                     vol.Optional(CONF_API_KEY, default=""): TextSelector(
                         TextSelectorConfig(type="password")
                     ),
@@ -259,6 +312,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                 dict(self.config_entry.options),
                 self.config_entry.title,
             )
+            current_connection = resolve_connection_config(self.config_entry)
             normalized_input = dict(user_input)
             if CONF_HOST in normalized_input:
                 try:
@@ -267,11 +321,34 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     )
                 except ValueError:
                     errors[CONF_HOST] = "invalid_host"
-            if CONF_PROFILE in normalized_input:
+
+            candidate_profile_route = current_connection.profile_route
+            if CONF_PROFILE_ROUTE in normalized_input:
                 try:
-                    normalized_input[CONF_PROFILE] = normalize_profile(
-                        normalized_input[CONF_PROFILE]
+                    candidate_profile_route = normalize_profile_route(
+                        normalized_input[CONF_PROFILE_ROUTE]
                     )
+                    normalized_input[CONF_PROFILE_ROUTE] = (
+                        candidate_profile_route.value
+                    )
+                except ValueError:
+                    errors[CONF_PROFILE_ROUTE] = "invalid_profile_route"
+
+            candidate_profile = current_connection.profile
+            if CONF_PROFILE_ROUTE not in errors:
+                try:
+                    candidate_profile = normalize_profile(
+                        normalized_input.get(
+                            CONF_PROFILE,
+                            current_connection.profile,
+                        ),
+                        candidate_profile_route,
+                    )
+                    if (
+                        CONF_PROFILE in normalized_input
+                        or candidate_profile != current_connection.profile
+                    ):
+                        normalized_input[CONF_PROFILE] = candidate_profile
                 except ValueError:
                     errors[CONF_PROFILE] = "invalid_profile"
 
@@ -281,6 +358,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     CONF_PORT,
                     CONF_API_KEY,
                     CONF_PROFILE,
+                    CONF_PROFILE_ROUTE,
                     CONF_USE_SSL,
                     CONF_VERIFY_SSL,
                 )
@@ -294,7 +372,6 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     for key, value in normalized_input.items()
                     if key not in connection_keys
                 }
-                current_connection = resolve_connection_config(self.config_entry)
                 candidate_host = new_data.get(CONF_HOST, current_connection.host)
                 candidate_port = new_data.get(CONF_PORT, current_connection.port)
                 candidate_api_key = (
@@ -308,16 +385,13 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     CONF_VERIFY_SSL,
                     current_connection.verify_ssl,
                 )
-                candidate_profile = new_data.get(
-                    CONF_PROFILE,
-                    current_connection.profile,
-                )
                 if _connection_is_configured(
                     self.hass.config_entries.async_entries(DOMAIN),
                     candidate_host,
                     candidate_port,
                     candidate_use_ssl,
                     candidate_profile,
+                    candidate_profile_route,
                     exclude_entry_id=self.config_entry.entry_id,
                 ):
                     errors["base"] = "already_configured"
@@ -329,6 +403,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     candidate_use_ssl,
                     candidate_verify_ssl,
                     candidate_profile,
+                    candidate_profile_route,
                 ) != (
                     current_connection.host,
                     current_connection.port,
@@ -336,6 +411,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     current_connection.use_ssl,
                     current_connection.verify_ssl,
                     current_connection.profile,
+                    current_connection.profile_route,
                 )
                 if not errors and connection_changed:
                     session = async_get_clientsession(self.hass)
@@ -347,6 +423,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                         use_ssl=candidate_use_ssl,
                         verify_ssl=candidate_verify_ssl,
                         profile=candidate_profile,
+                        profile_route=candidate_profile_route,
                     )
                     try:
                         await client.async_check_connection()
@@ -388,6 +465,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                                 candidate_port,
                                 candidate_use_ssl,
                                 candidate_profile,
+                                candidate_profile_route,
                                 exclude_entry_id=live_entry.entry_id,
                             ):
                                 errors["base"] = "already_configured"
@@ -427,6 +505,12 @@ class HermesConversationOptionsFlow(OptionsFlow):
                         CONF_PROFILE,
                         default=connection.profile,
                     ): str,
+                    vol.Required(
+                        CONF_PROFILE_ROUTE,
+                        default=connection.profile_route.value,
+                    ): SelectSelector(
+                        SelectSelectorConfig(options=_PROFILE_ROUTE_OPTIONS)
+                    ),
                     vol.Optional(
                         CONF_API_KEY,
                         default=connection.api_key or "",

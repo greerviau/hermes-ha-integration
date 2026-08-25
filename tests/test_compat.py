@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from tests.test_support import FakeConfigEntry
+import custom_components.hermes_conversation.compat as compat
+import custom_components.hermes_conversation.const as const
 from custom_components.hermes_conversation.compat import (
     entry_value,
     normalize_host,
@@ -23,6 +24,7 @@ from custom_components.hermes_conversation.const import (
     FOLLOW_UP_MODE_OFF,
     LEGACY_CONF_API_BASE_URL,
 )
+from tests.test_support import FakeConfigEntry
 
 
 class CompatTests(unittest.TestCase):
@@ -77,6 +79,61 @@ class CompatTests(unittest.TestCase):
         for value in invalid_values:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 normalize_profile(value)
+
+    def test_profile_route_family_is_closed_and_missing_defaults_to_addon(self):
+        self.assertEqual(
+            tuple(member.value for member in const.ProfileRouteFamily),
+            ("addon", "native"),
+        )
+        self.assertEqual(
+            compat.normalize_profile_route(None),
+            const.ProfileRouteFamily.ADDON,
+        )
+        self.assertEqual(
+            compat.normalize_profile_route("addon"),
+            const.ProfileRouteFamily.ADDON,
+        )
+        self.assertEqual(
+            compat.normalize_profile_route("native"),
+            const.ProfileRouteFamily.NATIVE,
+        )
+        for value in ("profile", "/p", "native/other", "", 1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                compat.normalize_profile_route(value)
+
+    def test_addon_profile_normalization_remains_backward_compatible(self):
+        self.assertEqual(normalize_profile(" Worker_2 ", "addon"), "Worker_2")
+        self.assertEqual(normalize_profile(" _Worker ", "addon"), "_Worker")
+
+    def test_native_profile_normalization_matches_hermes_profile_grammar(self):
+        self.assertEqual(normalize_profile(" Worker-Bot_2 ", "native"), "worker-bot_2")
+        self.assertEqual(normalize_profile("Default", "native"), "default")
+        self.assertEqual(normalize_profile("a" * 64, "native"), "a" * 64)
+        self.assertEqual(normalize_profile("   ", "native"), "")
+
+    def test_native_profile_rejects_reserved_and_adversarial_values(self):
+        invalid_values = (
+            "hermes",
+            "test",
+            "tmp",
+            "root",
+            "sudo",
+            "-worker",
+            "_worker",
+            ".",
+            "..",
+            "worker/other",
+            "worker\\other",
+            "%2fworker",
+            "worker?debug=1",
+            "worker#fragment",
+            "assistánt",
+            "a" * 65,
+            123,
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                normalize_profile(value, "native")
 
     def test_parse_api_base_url_with_scheme_and_port(self):
         parsed = parse_api_base_url("https://agent01.local:8443")
@@ -140,6 +197,64 @@ class CompatTests(unittest.TestCase):
         connection = resolve_connection_config(entry)
 
         self.assertEqual(connection.profile, "worker_1")
+
+    def test_resolve_connection_config_defaults_missing_route_to_addon(self):
+        entry = FakeConfigEntry(
+            data={
+                CONF_HOST: "agent.local",
+                CONF_PORT: 8443,
+                CONF_PROFILE: "Worker_1",
+            },
+            options={},
+        )
+
+        connection = resolve_connection_config(entry)
+
+        self.assertEqual(connection.profile_route, const.ProfileRouteFamily.ADDON)
+        self.assertEqual(connection.profile, "Worker_1")
+
+    def test_resolve_connection_config_normalizes_native_profile(self):
+        entry = FakeConfigEntry(
+            data={
+                CONF_HOST: "agent.local",
+                CONF_PORT: 8443,
+                CONF_PROFILE: " Worker-Bot ",
+                "profile_route": "native",
+            },
+            options={},
+        )
+
+        connection = resolve_connection_config(entry)
+
+        self.assertEqual(connection.profile_route, const.ProfileRouteFamily.NATIVE)
+        self.assertEqual(connection.profile, "worker-bot")
+
+    def test_resolve_connection_config_rejects_unknown_stored_route(self):
+        entry = FakeConfigEntry(
+            data={
+                CONF_HOST: "agent.local",
+                CONF_PORT: 8443,
+                "profile_route": "/tenant",
+            },
+            options={},
+        )
+
+        with self.assertRaises(ValueError):
+            resolve_connection_config(entry)
+
+    def test_resolve_connection_config_rejects_reserved_native_profile(self):
+        entry = FakeConfigEntry(
+            data={
+                CONF_HOST: "agent.local",
+                CONF_PORT: 8443,
+                CONF_PROFILE: "hermes",
+                "profile_route": "native",
+            },
+            options={},
+        )
+
+        with self.assertRaises(ValueError):
+            resolve_connection_config(entry)
 
     def test_resolve_connection_config_rejects_invalid_stored_profile(self):
         entry = FakeConfigEntry(

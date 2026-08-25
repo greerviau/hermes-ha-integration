@@ -28,6 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         port=connection.port,
         api_key=connection.api_key,
         profile=connection.profile,
+        profile_route=connection.profile_route,
         use_ssl=connection.use_ssl,
         verify_ssl=connection.verify_ssl,
         model=entry_value(entry, LEGACY_CONF_MODEL, None),

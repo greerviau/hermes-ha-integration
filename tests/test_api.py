@@ -117,6 +117,34 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             {"Authorization": "Bearer wrong-key"},
         )
 
+    async def test_native_probe_rejects_non_fail_closed_routing_before_credentials(self):
+        for profile in ("worker", "default"):
+            with self.subTest(profile=profile):
+                session = FakeSession(
+                    [
+                        self._health_response(),
+                        FakeResponse(json_data={"data": [{"id": "hermes-agent"}]}),
+                    ]
+                )
+                client = HermesApiClient(
+                    session=session,
+                    host="agent.local",
+                    port=8443,
+                    api_key="must-not-leak",
+                    profile=profile,
+                    profile_route="native",
+                )
+
+                with self.assertRaises(HermesConnectionError):
+                    await client.async_check_connection()
+
+                self.assertEqual(
+                    [call["url"] for call in session.calls],
+                    ["https://agent.local:8443/p/hermes/v1/health"],
+                )
+                self.assertEqual(session.calls[0]["headers"], {})
+                self.assertFalse(session.calls[0]["allow_redirects"])
+
     async def test_connection_probe_falls_back_to_models_when_legacy_health_is_missing(self):
         session = FakeSession(
             [
@@ -151,6 +179,74 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 "https://agent.local:8443/profile/worker/v1/models",
             ],
         )
+
+    async def test_native_probe_rejects_ambiguous_legacy_health_before_credentials(self):
+        session = FakeSession(
+            [
+                FakeResponse(status=404),
+                FakeResponse(status=404),
+                FakeResponse(
+                    json_data={
+                        "data": [
+                            {"id": "hermes-agent", "owned_by": "hermes"}
+                        ]
+                    }
+                ),
+            ]
+        )
+        client = HermesApiClient(
+            session=session,  # type: ignore[arg-type]
+            host="agent.local",
+            port=8443,
+            api_key="must-not-leak",
+            profile="worker",
+            profile_route="native",
+        )
+
+        with self.assertRaises(HermesConnectionError):
+            await client.async_check_connection()
+
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker/v1/health",
+            ],
+        )
+        self.assertTrue(all(call["headers"] == {} for call in session.calls))
+
+    async def test_native_runtime_requests_reverify_routing_before_credentials(self):
+        for operation in ("models", "non_streaming", "streaming"):
+            with self.subTest(operation=operation):
+                session = FakeSession([self._health_response()])
+                client = HermesApiClient(
+                    session=session,  # type: ignore[arg-type]
+                    host="agent.local",
+                    port=8443,
+                    api_key="must-not-leak",
+                    profile="worker",
+                    profile_route="native",
+                )
+
+                with self.assertRaises(HermesConnectionError):
+                    if operation == "models":
+                        await client.async_get_models()
+                    elif operation == "non_streaming":
+                        await client.async_send_message(
+                            [{"role": "user", "content": "hello"}]
+                        )
+                    else:
+                        async for _ in client.async_stream_message(
+                            [{"role": "user", "content": "hello"}]
+                        ):
+                            pass
+
+                self.assertEqual(
+                    [call["url"] for call in session.calls],
+                    ["https://agent.local:8443/p/hermes/v1/health"],
+                )
+                self.assertEqual(session.calls[0]["headers"], {})
+                self.assertFalse(session.calls[0]["allow_redirects"])
 
     async def test_legacy_fallback_rejects_generic_openai_models_response(self):
         session = FakeSession(
@@ -204,6 +300,17 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.base_url, "https://agent.local:8443")
 
+    def test_base_url_uses_root_for_blank_native_profile(self):
+        client = HermesApiClient(
+            session=FakeSession([]),
+            host="agent.local",
+            port=8443,
+            profile="",
+            profile_route="native",
+        )
+
+        self.assertEqual(client.base_url, "https://agent.local:8443")
+
     def test_base_url_normalizes_valid_profile(self):
         client = HermesApiClient(
             session=FakeSession([]),
@@ -216,6 +323,30 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             client.base_url,
             "https://agent.local:8443/profile/assistant_2",
         )
+
+    def test_base_url_uses_native_route_and_canonical_profile(self):
+        client = HermesApiClient(
+            session=FakeSession([]),
+            host="agent.local",
+            port=8443,
+            profile=" Worker-Bot_2 ",
+            profile_route="native",
+        )
+
+        self.assertEqual(
+            client.base_url,
+            "https://agent.local:8443/p/worker-bot_2",
+        )
+
+    def test_base_url_rejects_unknown_route_family(self):
+        with self.assertRaises(ValueError):
+            HermesApiClient(
+                session=FakeSession([]),
+                host="agent.local",
+                port=8443,
+                profile="worker",
+                profile_route="/tenant",
+            )
 
     def test_base_url_normalizes_dns_host_and_brackets_ipv6(self):
         dns_client = HermesApiClient(FakeSession([]), " AGENT.LOCAL. ", 8443)
@@ -241,6 +372,16 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 host="agent.local",
                 port=8443,
                 profile="../assistant",
+            )
+
+    def test_base_url_rejects_reserved_native_profile(self):
+        with self.assertRaises(ValueError):
+            HermesApiClient(
+                session=FakeSession([]),
+                host="agent.local",
+                port=8443,
+                profile="hermes",
+                profile_route="native",
             )
 
     async def test_profile_base_url_is_used_by_every_request_family(self):
@@ -287,6 +428,82 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 "https://agent.local:8443/profile/worker/v1/chat/completions",
             ],
         )
+
+    async def test_native_base_url_is_used_by_every_request_family(self):
+        chunks = [
+            "data: " + json.dumps({"choices": [{"delta": {"content": "ok"}}]}) + "\n",
+            "data: [DONE]\n",
+        ]
+        session = FakeSession(
+            [
+                FakeResponse(status=404),
+                self._health_response(),
+                FakeResponse(json_data={"data": [{"id": "hermes-agent"}]}),
+                FakeResponse(status=404),
+                self._health_response(),
+                FakeResponse(json_data={"data": []}),
+                FakeResponse(status=404),
+                self._health_response(),
+                FakeResponse(json_data={"choices": [{"message": {"content": "ok"}}]}),
+                FakeResponse(status=404),
+                self._health_response(),
+                FakeResponse(chunks=chunks),
+            ]
+        )
+        client = HermesApiClient(
+            session=session,
+            host="agent.local",
+            port=8443,
+            api_key="profile-key",
+            profile="Worker-Bot",
+            profile_route="native",
+        )
+
+        self.assertTrue(await client.async_check_connection())
+        await client.async_get_models()
+        await client.async_send_message([{"role": "user", "content": "hello"}])
+        self.assertEqual(
+            [
+                part
+                async for part in client.async_stream_message(
+                    [{"role": "user", "content": "hello"}]
+                )
+            ],
+            ["ok"],
+        )
+
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/models",
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/models",
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/chat/completions",
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/chat/completions",
+            ],
+        )
+        self.assertEqual(session.calls[0]["headers"], {})
+        self.assertFalse(session.calls[0]["allow_redirects"])
+        self.assertEqual(
+            session.calls[2]["headers"],
+            {"Authorization": "Bearer profile-key"},
+        )
+        self.assertFalse(session.calls[2]["allow_redirects"])
+        for index in (0, 1, 3, 4, 6, 7, 9, 10):
+            self.assertEqual(session.calls[index]["headers"], {})
+            self.assertFalse(session.calls[index]["allow_redirects"])
+        for index in (5, 8, 11):
+            self.assertEqual(
+                session.calls[index]["headers"],
+                {"Authorization": "Bearer profile-key"},
+            )
 
     async def test_health_non_success_status_raises_connection_error(self):
         client = HermesApiClient(
