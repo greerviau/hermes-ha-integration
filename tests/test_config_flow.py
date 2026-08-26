@@ -29,6 +29,7 @@ from custom_components.hermes_conversation.const import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPONENT_ROOT = REPO_ROOT / "custom_components" / "hermes_conversation"
+CONF_PROFILE_ROUTE = "profile_route"
 
 
 def connection_input(**overrides):
@@ -57,6 +58,10 @@ def successful_probe_responses():
     ]
 
 
+def native_successful_probe_responses():
+    return [FakeResponse(status=404), *successful_probe_responses()]
+
+
 class NoRequestSession:
     def get(self, *args, **kwargs):
         raise AssertionError("invalid input must be rejected before probing the API")
@@ -80,10 +85,78 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["type"], "create_entry")
         self.assertEqual(result["title"], "Hermes Agent (assistant_2)")
         self.assertEqual(result["data"][CONF_PROFILE], "assistant_2")
+        self.assertEqual(result["data"][CONF_PROFILE_ROUTE], "addon")
         self.assertEqual(
             session.calls[0]["url"],
             "https://agent.local:8443/profile/assistant_2/v1/health",
         )
+
+    async def test_user_step_exposes_closed_profile_route_selector(self):
+        flow = self.make_flow(FakeSession([]))
+
+        result = await flow.async_step_user()
+
+        selector = result["data_schema"][CONF_PROFILE_ROUTE]["select_selector"]
+        self.assertEqual(
+            [option["value"] for option in selector["options"]],
+            ["addon", "native"],
+        )
+
+    async def test_user_step_persists_native_route_and_probes_only_selected_path(self):
+        session = FakeSession(native_successful_probe_responses())
+        flow = self.make_flow(session)
+
+        result = await flow.async_step_user(
+            connection_input(
+                **{
+                    CONF_PROFILE: " Worker-Bot ",
+                    CONF_PROFILE_ROUTE: "native",
+                }
+            )
+        )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["data"][CONF_PROFILE], "worker-bot")
+        self.assertEqual(result["data"][CONF_PROFILE_ROUTE], "native")
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/models",
+            ],
+        )
+
+    async def test_user_step_rejects_unknown_route_before_connection_probe(self):
+        flow = self.make_flow(NoRequestSession())
+
+        result = await flow.async_step_user(
+            connection_input(**{CONF_PROFILE_ROUTE: "/tenant"})
+        )
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(
+            result["errors"],
+            {CONF_PROFILE_ROUTE: "invalid_profile_route"},
+        )
+
+    async def test_user_step_rejects_native_reserved_profile_before_probe(self):
+        for profile in ("hermes", "test", "tmp", "root", "sudo", "../worker"):
+            with self.subTest(profile=profile):
+                flow = self.make_flow(NoRequestSession())
+                result = await flow.async_step_user(
+                    connection_input(
+                        **{
+                            CONF_PROFILE: profile,
+                            CONF_PROFILE_ROUTE: "native",
+                        }
+                    )
+                )
+                self.assertEqual(result["type"], "form")
+                self.assertEqual(
+                    result["errors"],
+                    {CONF_PROFILE: "invalid_profile"},
+                )
 
     async def test_user_step_blank_profile_keeps_primary_title(self):
         flow = self.make_flow(FakeSession(successful_probe_responses()))
@@ -208,6 +281,59 @@ class ConfigFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["type"], "create_entry")
 
+    async def test_same_named_profile_with_different_route_family_is_allowed(self):
+        existing = FakeConfigEntry(
+            data=connection_input(**{CONF_PROFILE: "worker"})
+        )
+        flow = self.make_flow(
+            FakeSession(native_successful_probe_responses()),
+            [existing],
+        )
+
+        result = await flow.async_step_user(
+            connection_input(
+                **{
+                    CONF_PROFILE: "worker",
+                    CONF_PROFILE_ROUTE: "native",
+                }
+            )
+        )
+
+        self.assertEqual(result["type"], "create_entry")
+
+    async def test_blank_profile_duplicate_collapses_route_family(self):
+        existing = FakeConfigEntry(data=connection_input())
+        flow = self.make_flow(
+            FakeSession(successful_probe_responses()),
+            [existing],
+        )
+
+        with self.assertRaises(AbortFlow) as context:
+            await flow.async_step_user(
+                connection_input(**{CONF_PROFILE_ROUTE: "native"})
+            )
+
+        self.assertEqual(context.exception.reason, "already_configured")
+
+    async def test_native_default_alias_duplicates_root_profile(self):
+        existing = FakeConfigEntry(data=connection_input())
+        flow = self.make_flow(
+            FakeSession(native_successful_probe_responses()),
+            [existing],
+        )
+
+        with self.assertRaises(AbortFlow) as context:
+            await flow.async_step_user(
+                connection_input(
+                    **{
+                        CONF_PROFILE: "Default",
+                        CONF_PROFILE_ROUTE: "native",
+                    }
+                )
+            )
+
+        self.assertEqual(context.exception.reason, "already_configured")
+
     async def test_same_host_port_and_profile_with_different_transport_is_allowed(self):
         existing = FakeConfigEntry(data=connection_input(**{CONF_USE_SSL: True}))
         flow = self.make_flow(
@@ -245,6 +371,109 @@ class OptionsFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["type"], "form")
         self.assertIn(CONF_PROFILE, result["data_schema"])
+        selector = result["data_schema"][CONF_PROFILE_ROUTE]["select_selector"]
+        self.assertEqual(
+            [option["value"] for option in selector["options"]],
+            ["addon", "native"],
+        )
+
+    async def test_options_persists_native_route_and_probes_only_selected_path(self):
+        entry = FakeConfigEntry(
+            entry_id="current",
+            data={
+                **connection_input(**{CONF_PROFILE: "worker"}),
+                "preserve_me": "yes",
+            },
+            options={CONF_PROMPT: "old prompt", "preserve_option": "yes"},
+        )
+        session = FakeSession(native_successful_probe_responses())
+        flow = self.make_flow(entry, session=session)
+
+        result = await flow.async_step_init(
+            {
+                CONF_PROFILE: " Worker-Bot ",
+                CONF_PROFILE_ROUTE: "native",
+                CONF_PROMPT: "new prompt",
+            }
+        )
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(entry.data[CONF_PROFILE], "worker-bot")
+        self.assertEqual(entry.data[CONF_PROFILE_ROUTE], "native")
+        self.assertEqual(entry.data["preserve_me"], "yes")
+        self.assertEqual(entry.options["preserve_option"], "yes")
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://agent.local:8443/p/hermes/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/health",
+                "https://agent.local:8443/p/worker-bot/v1/models",
+            ],
+        )
+        self.assertEqual(len(flow.hass.config_entries.updated), 1)
+
+    async def test_options_rejects_unknown_route_without_mutation_or_probe(self):
+        entry = FakeConfigEntry(
+            data=connection_input(**{CONF_PROFILE: "worker"}),
+            options={CONF_PROMPT: "keep me"},
+        )
+        original_data = dict(entry.data)
+        flow = self.make_flow(entry, session=NoRequestSession())
+
+        result = await flow.async_step_init({CONF_PROFILE_ROUTE: "/tenant"})
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(
+            result["errors"],
+            {CONF_PROFILE_ROUTE: "invalid_profile_route"},
+        )
+        self.assertEqual(entry.data, original_data)
+        self.assertEqual(entry.options, {CONF_PROMPT: "keep me"})
+
+    async def test_options_rejects_invalid_native_profile_without_mutation_or_probe(self):
+        entry = FakeConfigEntry(
+            data=connection_input(**{CONF_PROFILE: "worker"}),
+            options={CONF_PROMPT: "keep me"},
+        )
+        original_data = dict(entry.data)
+        flow = self.make_flow(entry, session=NoRequestSession())
+
+        result = await flow.async_step_init(
+            {
+                CONF_PROFILE: "hermes",
+                CONF_PROFILE_ROUTE: "native",
+            }
+        )
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["errors"], {CONF_PROFILE: "invalid_profile"})
+        self.assertEqual(entry.data, original_data)
+        self.assertEqual(entry.options, {CONF_PROMPT: "keep me"})
+
+    async def test_options_blank_profile_duplicate_collapses_route_family(self):
+        entry = FakeConfigEntry(
+            entry_id="current",
+            data=connection_input(**{CONF_PROFILE: "worker"}),
+            options={CONF_PROMPT: "keep me"},
+        )
+        duplicate = FakeConfigEntry(
+            entry_id="root",
+            data=connection_input(),
+        )
+        original_data = dict(entry.data)
+        flow = self.make_flow(entry, session=NoRequestSession())
+        flow.hass.config_entries.entries = [entry, duplicate]
+
+        result = await flow.async_step_init(
+            {
+                CONF_PROFILE: "",
+                CONF_PROFILE_ROUTE: "native",
+            }
+        )
+
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["errors"], {"base": "already_configured"})
+        self.assertEqual(entry.data, original_data)
 
     async def test_options_update_profile_preserves_existing_data_and_updates_title(self):
         entry = FakeConfigEntry(
@@ -621,7 +850,12 @@ class PublicationMetadataTests(unittest.TestCase):
 
         self.assertEqual(strings, translation)
         self.assertEqual(strings["config"]["step"]["user"]["data"][CONF_PROFILE], "Profile")
+        self.assertEqual(
+            strings["config"]["step"]["user"]["data"][CONF_PROFILE_ROUTE],
+            "Profile route type",
+        )
         self.assertIn("invalid_profile", strings["config"]["error"])
+        self.assertIn("invalid_profile_route", strings["config"]["error"])
         self.assertEqual(
             strings["options"]["error"]["already_configured"],
             "This Hermes Agent endpoint and profile are already configured.",
@@ -631,10 +865,20 @@ class PublicationMetadataTests(unittest.TestCase):
             "entry_changed",
             "invalid_auth",
             "invalid_profile",
+            "invalid_profile_route",
             "unknown",
         ):
             self.assertIn(error_key, strings["options"]["error"])
         self.assertEqual(strings["options"]["step"]["init"]["data"][CONF_PROFILE], "Profile")
+        self.assertEqual(
+            strings["options"]["step"]["init"]["data"][CONF_PROFILE_ROUTE],
+            "Profile route type",
+        )
+        route_description = strings["config"]["step"]["user"]["data_description"][CONF_PROFILE_ROUTE]
+        self.assertIn("/profile/<name>", route_description)
+        self.assertIn("/p/<name>", route_description)
+        api_key_description = strings["config"]["step"]["user"]["data_description"][CONF_API_KEY]
+        self.assertIn("own API key", api_key_description)
 
     def test_readme_documents_profile_route_and_primary_workaround_neutrally(self):
         readme = (REPO_ROOT / "README.md").read_text()
@@ -645,6 +889,17 @@ class PublicationMetadataTests(unittest.TestCase):
         self.assertIn("not a filesystem path", lowered)
         self.assertIn("worker", lowered)
         self.assertIn("assistant_2", lowered)
+        self.assertIn("/profile/<name>", lowered)
+        self.assertIn("/p/<name>", lowered)
+        self.assertIn("each profile's own api key", lowered)
+        self.assertIn("reserved native profile", lowered)
+        self.assertIn("must return `404`", lowered)
+        self.assertIn("before every credentialed request", lowered)
+        self.assertIn("selected native route must return `200`", lowered)
+        self.assertIn(
+            "legacy health fallback applies only to root and add-on routes",
+            lowered,
+        )
 
 
 if __name__ == "__main__":

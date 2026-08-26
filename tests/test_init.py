@@ -59,6 +59,28 @@ class InitTests(unittest.IsolatedAsyncioTestCase):
             "https://agent.local:8443/profile/assistant",
         )
 
+    async def test_setup_passes_native_profile_route_to_api_client(self):
+        hass = FakeHass()
+        entry = FakeConfigEntry(
+            data={
+                CONF_HOST: "agent.local",
+                CONF_PORT: 8443,
+                CONF_API_KEY: "profile-key",
+                CONF_USE_SSL: True,
+                CONF_PROFILE: "Worker-Bot",
+                "profile_route": "native",
+            },
+            options={},
+        )
+
+        await integration.async_setup_entry(hass, entry)
+
+        client = hass.data[DOMAIN][entry.entry_id]["client"]
+        self.assertEqual(
+            client.base_url,
+            "https://agent.local:8443/p/worker-bot",
+        )
+
     async def test_setup_legacy_entry_uses_root_api(self):
         hass = FakeHass()
         entry = FakeConfigEntry(

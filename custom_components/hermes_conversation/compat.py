@@ -17,19 +17,24 @@ from .const import (
     CONF_HOST,
     CONF_PORT,
     CONF_PROFILE,
+    CONF_PROFILE_ROUTE,
     CONF_USE_SSL,
     CONF_VERIFY_SSL,
     DEFAULT_CONTINUED_CONVERSATION_MODE,
     DEFAULT_HOST,
     DEFAULT_ENABLE_CONTINUED_CONVERSATION,
     DEFAULT_PORT,
+    DEFAULT_PROFILE_ROUTE,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODES,
     LEGACY_CONF_API_BASE_URL,
+    ProfileRouteFamily,
 )
 
 
 _PROFILE_PATTERN = re.compile(r"^_?[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*$")
+_NATIVE_PROFILE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_NATIVE_RESERVED_PROFILES = frozenset({"hermes", "test", "tmp", "root", "sudo"})
 _HOST_LABEL_PATTERN = re.compile(
     r"^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$"
 )
@@ -43,6 +48,7 @@ class HermesConnectionConfig:
     port: int
     api_key: str | None
     profile: str
+    profile_route: ProfileRouteFamily
     use_ssl: bool
     verify_ssl: bool
 
@@ -77,8 +83,26 @@ def entry_value(
     return default
 
 
-def normalize_profile(value: Any) -> str:
-    """Return a safe add-on profile route segment, or fail closed."""
+def normalize_profile_route(value: Any) -> ProfileRouteFamily:
+    """Return a supported profile route family, defaulting legacy entries."""
+    if value is None:
+        return DEFAULT_PROFILE_ROUTE
+    if isinstance(value, ProfileRouteFamily):
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Profile route must be a supported route family")
+    try:
+        return ProfileRouteFamily(value)
+    except ValueError as err:
+        raise ValueError("Profile route must be addon or native") from err
+
+
+def normalize_profile(
+    value: Any,
+    profile_route: ProfileRouteFamily | str | None = None,
+) -> str:
+    """Return a safe route-specific profile segment, or fail closed."""
+    route = normalize_profile_route(profile_route)
     if value is None:
         return ""
     if not isinstance(value, str):
@@ -87,6 +111,15 @@ def normalize_profile(value: Any) -> str:
     profile = value.strip()
     if not profile:
         return ""
+    if route is ProfileRouteFamily.NATIVE:
+        profile = profile.lower()
+        if _NATIVE_PROFILE_PATTERN.fullmatch(profile) is None:
+            raise ValueError(
+                "Native profile must match [a-z0-9][a-z0-9_-]{0,63}"
+            )
+        if profile != "default" and profile in _NATIVE_RESERVED_PROFILES:
+            raise ValueError("Native profile name is reserved")
+        return profile
     if _PROFILE_PATTERN.fullmatch(profile) is None:
         raise ValueError("Profile must contain only ASCII letters, digits, and underscores")
     return profile
@@ -124,8 +157,12 @@ def resolve_connection_config(entry: ConfigEntry) -> HermesConnectionConfig:
     host = entry_value(entry, CONF_HOST, prefer_options=False)
     port = entry_value(entry, CONF_PORT, prefer_options=False)
     api_key = entry_value(entry, CONF_API_KEY, prefer_options=False) or None
+    profile_route = normalize_profile_route(
+        entry_value(entry, CONF_PROFILE_ROUTE, prefer_options=False)
+    )
     profile = normalize_profile(
-        entry_value(entry, CONF_PROFILE, "", prefer_options=False)
+        entry_value(entry, CONF_PROFILE, "", prefer_options=False),
+        profile_route,
     )
     use_ssl = entry_value(entry, CONF_USE_SSL, prefer_options=False)
     verify_ssl = entry_value(entry, CONF_VERIFY_SSL, prefer_options=False)
@@ -136,6 +173,7 @@ def resolve_connection_config(entry: ConfigEntry) -> HermesConnectionConfig:
             port=_coerce_int(port, DEFAULT_PORT),
             api_key=api_key,
             profile=profile,
+            profile_route=profile_route,
             use_ssl=True if use_ssl is None else bool(use_ssl),
             verify_ssl=False if verify_ssl is None else bool(verify_ssl),
         )
@@ -152,6 +190,7 @@ def resolve_connection_config(entry: ConfigEntry) -> HermesConnectionConfig:
             port=parsed.port,
             api_key=api_key,
             profile=profile,
+            profile_route=profile_route,
             use_ssl=parsed.use_ssl if use_ssl is None else bool(use_ssl),
             verify_ssl=False if verify_ssl is None else bool(verify_ssl),
         )
@@ -161,6 +200,7 @@ def resolve_connection_config(entry: ConfigEntry) -> HermesConnectionConfig:
         port=DEFAULT_PORT,
         api_key=api_key,
         profile=profile,
+        profile_route=profile_route,
         use_ssl=True if use_ssl is None else bool(use_ssl),
         verify_ssl=False if verify_ssl is None else bool(verify_ssl),
     )
