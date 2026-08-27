@@ -375,7 +375,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         user_name = await self._get_user_name(user_input)
 
         # Build system prompt (optional — Hermes Agent has its own)
-        system_prompt = self._render_system_prompt(user_name)
+        system_prompt = self._render_system_prompt(user_name, user_input)
 
         # Append extra system prompt from HA voice pipeline if present
         extra = getattr(user_input, "extra_system_prompt", None)
@@ -584,7 +584,11 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             _LOGGER.debug("Could not resolve username", exc_info=True)
         return "the user"
 
-    def _render_system_prompt(self, user_name: str) -> str:
+    def _render_system_prompt(
+        self,
+        user_name: str,
+        user_input: ConversationInput | None = None,
+    ) -> str:
         """Render the system prompt template with HA context."""
         prompt_template = entry_value(
             self.entry,
@@ -598,6 +602,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         variables: dict[str, Any] = {
             "ha_name": self.hass.config.location_name,
             "user_name": user_name,
+            **self._get_origin_prompt_variables(user_input),
         }
 
         include_entities = entry_value(
@@ -630,6 +635,59 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             return f"{system_prompt}\n\n{_AUTO_FOLLOW_UP_PROMPT}"
 
         return _AUTO_FOLLOW_UP_PROMPT
+
+    def _get_origin_prompt_variables(
+        self, user_input: ConversationInput | None
+    ) -> dict[str, str]:
+        """Return exact origin IDs and a paired media player, when available."""
+        if user_input is None:
+            return {
+                "origin_satellite": "",
+                "origin_media_player": "",
+                "origin_device": "",
+            }
+
+        satellite_id = getattr(user_input, "satellite_id", None) or ""
+        device_id = getattr(user_input, "device_id", None) or ""
+        entity_reg = er.async_get(self.hass)
+
+        # A satellite is normally an entity whose registry entry points to its device.
+        if not device_id and satellite_id:
+            try:
+                satellite_entry = entity_reg.async_get(satellite_id)
+            except (AttributeError, TypeError, ValueError):
+                satellite_entry = None
+            device_id = getattr(satellite_entry, "device_id", None) or ""
+
+        media_player = ""
+        if device_id:
+            entries: Any = ()
+            try:
+                entries_for_device = getattr(entity_reg, "async_entries_for_device", None)
+                if callable(entries_for_device):
+                    entries = entries_for_device(device_id)
+                else:
+                    entries = entity_reg.async_entries()
+            except (AttributeError, TypeError, ValueError):
+                entries = ()
+            for entity_entry in entries:
+                entity_id = getattr(entity_entry, "entity_id", "") or ""
+                domain = (
+                    getattr(entity_entry, "domain", None)
+                    or entity_id.partition(".")[0]
+                )
+                if (
+                    domain == "media_player"
+                    and getattr(entity_entry, "device_id", None) == device_id
+                ):
+                    media_player = entity_id
+                    break
+
+        return {
+            "origin_satellite": satellite_id,
+            "origin_media_player": media_player,
+            "origin_device": device_id,
+        }
 
     def _get_exposed_entities(self) -> list[dict[str, Any]]:
         """Get a list of entities exposed to the conversation agent."""
@@ -818,8 +876,15 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             lines.append(f"Language: {language}")
         if device_id:
             lines.extend(self._describe_device(device_id))
+            lines.append(f"Origin device_id: {device_id}")
         if satellite_id:
             lines.extend(self._describe_satellite(satellite_id))
+            lines.append(f"Origin satellite_id: {satellite_id}")
+        media_player = self._get_origin_prompt_variables(user_input)[
+            "origin_media_player"
+        ]
+        if media_player:
+            lines.append(f"Origin media_player: {media_player}")
         return lines
 
     def _describe_device(self, device_id: str) -> list[str]:

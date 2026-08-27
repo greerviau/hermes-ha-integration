@@ -106,6 +106,15 @@ class FakeTemplate:
         rendered = self.text
         rendered = rendered.replace("{{ user_name }}", str(variables.get("user_name", "")))
         rendered = rendered.replace("{{ ha_name }}", str(variables.get("ha_name", "")))
+        rendered = rendered.replace(
+            "{{ origin_satellite }}", str(variables.get("origin_satellite", ""))
+        )
+        rendered = rendered.replace(
+            "{{ origin_media_player }}", str(variables.get("origin_media_player", ""))
+        )
+        rendered = rendered.replace(
+            "{{ origin_device }}", str(variables.get("origin_device", ""))
+        )
         return rendered
 
 
