@@ -359,6 +359,73 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         rendered = agent._render_system_prompt("Chalkers")
         self.assertIn("Legacy system prompt", rendered)
 
+    def test_origin_satellite_is_available_in_prompt_variables(self):
+        entry = FakeConfigEntry(options={CONF_PROMPT: "sat={{ origin_satellite }}"})
+        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
+
+        rendered = agent._render_system_prompt(
+            "Chalkers",
+            FakeConversationInput("hello", satellite_id="assist_satellite.voice_pebble"),
+        )
+
+        self.assertEqual(rendered, "sat=assist_satellite.voice_pebble")
+
+    def test_origin_media_player_resolves_from_satellite_device(self):
+        hass = FakeHass()
+        hass._entity_registry = SimpleNamespace(
+            async_get=lambda entity_id: SimpleNamespace(
+                device_id="voice-device" if entity_id.startswith("assist_satellite") else None,
+                entity_id=entity_id,
+            ),
+            async_entries=lambda: [
+                SimpleNamespace(entity_id="media_player.voice_pebble", device_id="voice-device")
+            ],
+        )
+        entry = FakeConfigEntry(
+            options={
+                CONF_PROMPT: "player={{ origin_media_player }} device={{ origin_device }}"
+            }
+        )
+        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
+
+        rendered = agent._render_system_prompt(
+            "Chalkers",
+            FakeConversationInput("hello", satellite_id="assist_satellite.voice_pebble"),
+        )
+
+        self.assertEqual(rendered, "player=media_player.voice_pebble device=voice-device")
+
+    def test_unknown_origin_context_variables_are_empty(self):
+        entry = FakeConfigEntry(options={CONF_PROMPT: "{{ origin_satellite }}|{{ origin_media_player }}|{{ origin_device }}"})
+        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
+
+        self.assertEqual(agent._render_system_prompt("Chalkers", FakeConversationInput("hello")), "||")
+        self.assertEqual(
+            agent._render_system_prompt(
+                "Chalkers", FakeConversationInput("hello", satellite_id="assist_satellite.unknown")
+            ),
+            "assist_satellite.unknown||",
+        )
+
+    def test_existing_prompt_rendering_remains_valid_without_origin_input(self):
+        entry = FakeConfigEntry(options={CONF_PROMPT: "{{ user_name }} at {{ ha_name }}"})
+        agent = HermesConversationAgent(FakeHass(location_name="Home"), entry, FakeClient(), session_map={})
+
+        self.assertEqual(agent._render_system_prompt("Chalkers"), "Chalkers at Home")
+
+    def test_origin_context_includes_exact_ids(self):
+        entry = FakeConfigEntry()
+        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
+
+        lines = agent._build_origin_context(
+            FakeConversationInput(
+                "hello", device_id="device-123", satellite_id="assist_satellite.voice"
+            )
+        )
+
+        self.assertIn("Origin device_id: device-123", lines)
+        self.assertIn("Origin satellite_id: assist_satellite.voice", lines)
+
     def test_exposed_entities_include_alias_domain_and_device_area(self):
         state = SimpleNamespace(
             entity_id="light.kitchen_ceiling",
