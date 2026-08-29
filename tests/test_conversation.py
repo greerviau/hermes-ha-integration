@@ -18,6 +18,7 @@ from custom_components.hermes_conversation.const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
+    CONF_SPEECH_NORMALIZATION,
     DEFAULT_PROMPT,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
@@ -608,6 +609,27 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             hass.data["last_chat_log"].deltas,
             [{"role": "assistant"}, {"content": "Hello"}, {"content": " there"}],
+        )
+
+    async def test_speech_normalization_preserves_stream_chunk_spaces(self):
+        entry = FakeConfigEntry(
+            data={CONF_API_KEY: "secret"},
+            options={
+                CONF_ENABLE_SESSION_REUSE: True,
+                CONF_PROMPT: "",
+                CONF_SPEECH_NORMALIZATION: True,
+            },
+        )
+        client = FakeClient(stream_chunks=["Cost: $", "100 and ", "20%"])
+        agent = HermesConversationAgent(FakeHass(), entry, client, session_map={})
+
+        result = await agent.async_process(
+            FakeConversationInput("price", conversation_id="conv-normalized-stream")
+        )
+
+        self.assertEqual(
+            result.response.speech["plain"]["speech"],
+            "Cost: one hundred dollars and 20 percent",
         )
 
     async def test_streaming_filters_reasoning_and_tool_markup(self):

@@ -574,9 +574,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         session_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield speech-safe assistant text chunks from Hermes streaming."""
-        speech_filter = _UnsafeSpeechStreamFilter(
-            normalize_speech=self._speech_normalization_enabled()
-        )
+        speech_filter = _UnsafeSpeechStreamFilter()
         stream_started = False
 
         try:
