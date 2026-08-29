@@ -50,6 +50,7 @@ from .const import (
     CONF_PROFILE_ROUTE,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
+    CONF_SPEECH_NORMALIZATION,
     CONF_USE_SSL,
     CONF_VERIFY_SSL,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
@@ -62,6 +63,7 @@ from .const import (
     DEFAULT_PROFILE_ROUTE,
     DEFAULT_PROMPT,
     DEFAULT_SESSION_TIMEOUT_SECONDS,
+    DEFAULT_SPEECH_NORMALIZATION,
     DOMAIN,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
@@ -604,6 +606,14 @@ class HermesConversationOptionsFlow(OptionsFlow):
                             DEFAULT_FALLBACK_TTS_ENGINE,
                         ),
                     ): str,
+                    vol.Optional(
+                        CONF_SPEECH_NORMALIZATION,
+                        default=entry_value(
+                            self.config_entry,
+                            CONF_SPEECH_NORMALIZATION,
+                            DEFAULT_SPEECH_NORMALIZATION,
+                        ),
+                    ): bool,
                 }
             ),
             errors=errors,
