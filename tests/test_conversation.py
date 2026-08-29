@@ -580,6 +580,16 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("entity.aliases", DEFAULT_PROMPT)
         self.assertIn("entity.area", DEFAULT_PROMPT)
 
+    def test_speech_normalization_is_opt_in(self):
+        self.assertEqual(
+            conversation_module._sanitize_text_for_speech("Cost: $100, or 20%", normalize_speech=False),
+            "Cost: $100, or 20%",
+        )
+        self.assertEqual(
+            conversation_module._sanitize_text_for_speech("Cost: $100, or 20%", normalize_speech=True),
+            "Cost: one hundred dollars, or 20 percent",
+        )
+
     async def test_entity_streams_safe_deltas_to_chat_log(self):
         entry = FakeConfigEntry(
             data={CONF_API_KEY: "secret"},

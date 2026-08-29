@@ -36,6 +36,7 @@ CONF_EXPOSE_DEVICE_CONTEXT = "expose_device_context"
 CONF_ALWAYS_SPEAK_FALLBACK = "always_speak_fallback"
 CONF_FALLBACK_MEDIA_PLAYER = "fallback_media_player"
 CONF_FALLBACK_TTS_ENGINE = "fallback_tts_engine"
+CONF_SPEECH_NORMALIZATION = "speech_normalization"
 
 # Legacy config keys still found in existing local installs.
 LEGACY_CONF_API_BASE_URL = "api_base_url"
@@ -71,6 +72,7 @@ DEFAULT_EXPOSE_DEVICE_CONTEXT = True
 DEFAULT_ALWAYS_SPEAK_FALLBACK = False
 DEFAULT_FALLBACK_MEDIA_PLAYER = ""
 DEFAULT_FALLBACK_TTS_ENGINE = ""
+DEFAULT_SPEECH_NORMALIZATION = False
 
 DEFAULT_PROMPT = (
     "You are in a voice chat with {{ user_name }} via the Home Assistant app.\n"

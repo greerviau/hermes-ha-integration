@@ -41,6 +41,7 @@ from .const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
+    CONF_SPEECH_NORMALIZATION,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
     DEFAULT_CONTEXT_MAX_CHARS,
     DEFAULT_ENABLE_SESSION_REUSE,
@@ -51,6 +52,7 @@ from .const import (
     DEFAULT_MAX_HISTORY_MESSAGES,
     DEFAULT_PROMPT,
     DEFAULT_SESSION_TIMEOUT_SECONDS,
+    DEFAULT_SPEECH_NORMALIZATION,
     DOMAIN,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
@@ -120,9 +122,10 @@ async def async_setup_entry(
 class _UnsafeSpeechStreamFilter:
     """Incrementally drop hidden reasoning and tool markup from streamed speech."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, normalize_speech: bool = False) -> None:
         self._buffer = ""
         self._discard_until_tag: str | None = None
+        self._normalize_speech = normalize_speech
 
     def feed(self, text: str) -> str:
         """Add a stream delta and return the safe text that can be emitted now."""
@@ -182,7 +185,9 @@ class _UnsafeSpeechStreamFilter:
             safe_parts.append(self._consume_safe_buffer(final=final))
             break
 
-        return _sanitize_stream_text_for_speech("".join(safe_parts))
+        return _sanitize_stream_text_for_speech(
+            "".join(safe_parts), normalize_speech=self._normalize_speech
+        )
 
     def _consume_safe_buffer(self, *, final: bool) -> str:
         if final:
@@ -212,7 +217,9 @@ def _remove_unsafe_speech_markup(text: str) -> str:
     return _UNSAFE_SPEECH_TAG_RE.sub("", cleaned)
 
 
-def _sanitize_stream_text_for_speech(text: str) -> str:
+def _sanitize_stream_text_for_speech(
+    text: str, *, normalize_speech: bool = False
+) -> str:
     """Apply safe, local cleanup to a speech stream delta."""
     if not text:
         return text
@@ -220,16 +227,65 @@ def _sanitize_stream_text_for_speech(text: str) -> str:
     cleaned = _remove_unsafe_speech_markup(cleaned)
     cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
     cleaned = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned)
-    return (
+    cleaned = (
         cleaned.replace("```", "")
         .replace("`", "")
         .replace("**", "")
         .replace("__", "")
         .replace("~~", "")
     )
+    return _normalize_speech_text(cleaned) if normalize_speech else cleaned
 
 
-def _sanitize_text_for_speech(text: str) -> str:
+def _normalize_speech_text(text: str) -> str:
+    """Expand common symbols into wording that Piper can speak naturally."""
+    if not text:
+        return text
+
+    def replace_currency(match: re.Match[str]) -> str:
+        amount = match.group(1)
+        if "." in amount:
+            dollars, cents = amount.split(".", 1)
+            cents = cents.ljust(2, "0")
+            return (
+                f"{_number_to_words(int(dollars))} dollars and "
+                f"{_number_to_words(int(cents))} cents"
+            )
+        return f"{_number_to_words(int(amount))} dollars"
+
+    normalized = re.sub(r"\$(\d+(?:\.\d{1,2})?)", replace_currency, text)
+    normalized = re.sub(r"(?<=\d)%", " percent", normalized)
+    normalized = normalized.replace("≈", "approximately")
+    normalized = normalized.replace("&", " and ")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def _number_to_words(number: int) -> str:
+    """Convert a non-negative integer into concise English words."""
+    ones = (
+        "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    )
+    tens = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
+    if number < 20:
+        return ones[number]
+    if number < 100:
+        return tens[number // 10] + (f"-{ones[number % 10]}" if number % 10 else "")
+    if number < 1000:
+        remainder = number % 100
+        return f"{ones[number // 100]} hundred" + (f" {_number_to_words(remainder)}" if remainder else "")
+    for scale, name in ((1_000_000, "million"), (1_000, "thousand")):
+        if number >= scale:
+            remainder = number % scale
+            return f"{_number_to_words(number // scale)} {name}" + (f" {_number_to_words(remainder)}" if remainder else "")
+    return str(number)
+
+
+def _sanitize_text_for_speech(
+    text: str, *, normalize_speech: bool = False
+) -> str:
     """Convert markdown-ish assistant output into plain speech-friendly text."""
     if not text:
         return text
@@ -252,7 +308,8 @@ def _sanitize_text_for_speech(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
-    return cleaned.strip()
+    cleaned = cleaned.strip()
+    return _normalize_speech_text(cleaned) if normalize_speech else cleaned
 
 
 class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
@@ -416,7 +473,10 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     messages,
                     session_id=session_id,
                 )
-            spoken_text = _sanitize_text_for_speech(response_text)
+            spoken_text = _sanitize_text_for_speech(
+                response_text,
+                normalize_speech=self._speech_normalization_enabled(),
+            )
         except HermesApiError as err:
             _LOGGER.error("Hermes API error: %s", err)
             intent_response = intent.IntentResponse(language=user_input.language)
@@ -514,7 +574,9 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         session_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield speech-safe assistant text chunks from Hermes streaming."""
-        speech_filter = _UnsafeSpeechStreamFilter()
+        speech_filter = _UnsafeSpeechStreamFilter(
+            normalize_speech=self._speech_normalization_enabled()
+        )
         stream_started = False
 
         try:
@@ -532,7 +594,10 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 err,
             )
             result = await self.client.async_send_message(messages, session_id=session_id)
-            if safe_text := _sanitize_text_for_speech(result.text):
+            if safe_text := _sanitize_text_for_speech(
+                result.text,
+                normalize_speech=self._speech_normalization_enabled(),
+            ):
                 yield safe_text
             return
 
@@ -542,6 +607,16 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
     def _agent_id(self) -> str:
         """Return the best available Home Assistant agent identifier."""
         return getattr(self, "entity_id", None) or self.entry.entry_id
+
+    def _speech_normalization_enabled(self) -> bool:
+        """Return whether optional speech symbol normalization is enabled."""
+        return bool(
+            entry_value(
+                self.entry,
+                CONF_SPEECH_NORMALIZATION,
+                DEFAULT_SPEECH_NORMALIZATION,
+            )
+        )
 
     async def _get_response(
         self,
