@@ -665,7 +665,33 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tool_call", chat_text)
         self.assertNotIn("terminal", chat_text)
 
-    async def test_streaming_keeps_display_text_un_normalized_for_chat_log(self):
+    async def test_streaming_adds_missing_currency_boundary_without_normalization(self):
+        entry = FakeConfigEntry(
+            data={CONF_API_KEY: "secret"},
+            options={
+                CONF_ENABLE_SESSION_REUSE: True,
+                CONF_PROMPT: "",
+                CONF_SPEECH_NORMALIZATION: False,
+            },
+        )
+        client = FakeClient(stream_chunks=["The total is$100 and 20% of it is mine"])
+        hass = FakeHass()
+        agent = HermesConversationAgent(hass, entry, client, session_map={})
+
+        result = await agent.async_process(
+            FakeConversationInput("how much", conversation_id="conv-currency-raw")
+        )
+
+        self.assertEqual(
+            result.response.speech["plain"]["speech"],
+            "The total is $100 and 20% of it is mine",
+        )
+        self.assertEqual(
+            hass.data["last_chat_log"].content[-1].content,
+            "The total is$100 and 20% of it is mine",
+        )
+
+    async def test_streaming_adds_missing_currency_boundary_before_normalization(self):
         entry = FakeConfigEntry(
             data={CONF_API_KEY: "secret"},
             options={
@@ -674,21 +700,21 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
                 CONF_SPEECH_NORMALIZATION: True,
             },
         )
-        client = FakeClient(stream_chunks=["The total is $100 and 20%."])
+        client = FakeClient(stream_chunks=["The total is$100 and 20% of it is mine"])
         hass = FakeHass()
         agent = HermesConversationAgent(hass, entry, client, session_map={})
 
         result = await agent.async_process(
-            FakeConversationInput("how much", conversation_id="conv-normalized-stream")
+            FakeConversationInput("how much", conversation_id="conv-currency-normalized")
         )
 
         self.assertEqual(
             result.response.speech["plain"]["speech"],
-            "The total is one hundred dollars and twenty percent.",
+            "The total is one hundred dollars and twenty percent of it is mine",
         )
         self.assertEqual(
             hass.data["last_chat_log"].content[-1].content,
-            "The total is $100 and 20%.",
+            "The total is$100 and 20% of it is mine",
         )
 
     async def test_streaming_fallback_keeps_display_text_un_normalized(self):

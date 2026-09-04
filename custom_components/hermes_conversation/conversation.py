@@ -392,6 +392,8 @@ def _sanitize_text_for_speech(
     cleaned = re.sub(r"(?<!_)_(?!\s)(.*?)(?<!\s)_(?!_)", r"\1", cleaned)
     cleaned = re.sub(r"~~(.*?)~~", r"\1", cleaned)
     cleaned = re.sub(r"\[(.*?)\]\[[^\]]*\]", r"\1", cleaned)
+    # Restore a readable boundary when the response joins a word to currency.
+    cleaned = re.sub(r"(?<=[A-Za-z])\$(?=\d)", " $", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
