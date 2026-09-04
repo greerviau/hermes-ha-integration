@@ -8,15 +8,16 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
+from datetime import date
 from typing import Any
 
 from homeassistant.components.conversation import (
+    MATCH_ALL,
     AbstractConversationAgent,
     ConversationEntity,
     ConversationEntityFeature,
     ConversationInput,
     ConversationResult,
-    MATCH_ALL,
     async_set_agent,
     async_unset_agent,
 )
@@ -98,6 +99,10 @@ _UNSAFE_SPEECH_START_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_UNSAFE_CLOSE_TAG_LENGTH = 80
+_MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
 
 
 async def async_setup_entry(
@@ -238,7 +243,7 @@ def _sanitize_stream_text_for_speech(
 
 
 def _normalize_speech_text(text: str) -> str:
-    """Expand common symbols into wording that Piper can speak naturally."""
+    """Expand conservative, common English forms for speech."""
     if not text:
         return text
 
@@ -257,8 +262,82 @@ def _normalize_speech_text(text: str) -> str:
     normalized = re.sub(r"(?<=\d)%", " percent", normalized)
     normalized = normalized.replace("≈", "approximately")
     normalized = normalized.replace("&", " and ")
+
+    def replace_date(match: re.Match[str]) -> str:
+        year, month, day = (int(part) for part in match.groups())
+        try:
+            date(year, month, day)
+        except ValueError:
+            return match.group(0)
+        return f"{_MONTH_NAMES[month - 1]} {_ordinal_to_words(day)}, {_year_to_words(year)}"
+
+    # Handle dates before protecting subtraction expressions (the date hyphens
+    # must not be mistaken for minus signs).
+    normalized = re.sub(r"\b(\d{4})-(\d{2})-(\d{2})\b", replace_date, normalized)
+
+    # Do not alter identifiers, URLs, IPs, UUIDs, versions, or arithmetic.
+    protected: list[str] = []
+
+    def protect(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"__HERMES_PROTECTED_{len(protected) - 1}__"
+
+    normalized = re.sub(
+        r"(?:https?://|www\.)\S+|\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[A-Za-z_][\w.-]*\d[\w.-]*\b|(?<!\w)\d+(?:\s*[+*/-]\s*\d+)+(?!\w)",
+        protect,
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    def replace_time(match: re.Match[str]) -> str:
+        hour, minute = (int(part) for part in match.groups())
+        if hour > 23 or minute > 59:
+            return match.group(0)
+        if hour == 0 and minute == 0:
+            return "midnight"
+        if hour == 12 and minute == 0:
+            return "noon"
+        suffix = "AM" if hour < 12 else "PM"
+        spoken_hour = _number_to_words(hour % 12 or 12)
+        if minute == 0:
+            spoken_minute = ""
+        elif minute < 10:
+            spoken_minute = f"oh {_number_to_words(minute)}"
+        else:
+            spoken_minute = _number_to_words(minute)
+        return f"{spoken_hour}{f' {spoken_minute}' if spoken_minute else ''} {suffix}"
+
+    normalized = re.sub(r"\b(\d{1,2}):(\d{2})\b", replace_time, normalized)
+    normalized = re.sub(
+        r"(?<![\w.])(\d{1,3}(?:,\d{3})*|\d+)(?![\w.])",
+        lambda match: _number_to_words(int(match.group(1).replace(",", ""))),
+        normalized,
+    )
+    for index, original in enumerate(protected):
+        normalized = normalized.replace(f"__HERMES_PROTECTED_{index}__", original)
     normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
+
+
+def _ordinal_to_words(number: int) -> str:
+    """Convert the day of a month to a short English ordinal."""
+    irregular = {
+        1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth",
+        9: "ninth", 12: "twelfth",
+    }
+    if number in irregular:
+        return irregular[number]
+    if 10 < number < 14:
+        return f"{_number_to_words(number)}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{_number_to_words(number)}{suffix}"
+
+
+def _year_to_words(year: int) -> str:
+    """Speak a four-digit year in its usual conversational form."""
+    if 1000 <= year <= 2099:
+        return f"{_number_to_words(year // 100)} {_number_to_words(year % 100)}" if year % 100 else _number_to_words(year // 100) + " hundred"
+    return _number_to_words(year)
 
 
 def _number_to_words(number: int) -> str:

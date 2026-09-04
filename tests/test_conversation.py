@@ -5,10 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tests.test_support import FakeConfigEntry, FakeConversationInput, FakeHass
-from custom_components.hermes_conversation.api import HermesStreamSetupError
 from custom_components.hermes_conversation import conversation as conversation_module
-from custom_components.hermes_conversation.conversation import HermesConversationAgent
+from custom_components.hermes_conversation.api import HermesStreamSetupError
 from custom_components.hermes_conversation.const import (
     CONF_API_KEY,
     CONF_CONTEXT_MAX_CHARS,
@@ -25,6 +23,8 @@ from custom_components.hermes_conversation.const import (
     FOLLOW_UP_MODE_OFF,
     LEGACY_CONF_INSTRUCTIONS,
 )
+from custom_components.hermes_conversation.conversation import HermesConversationAgent
+from tests.test_support import FakeConfigEntry, FakeConversationInput, FakeHass
 
 
 class FakeClient:
@@ -588,8 +588,20 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             conversation_module._sanitize_text_for_speech("Cost: $100, or 20%", normalize_speech=True),
-            "Cost: one hundred dollars, or 20 percent",
+            "Cost: one hundred dollars, or twenty percent",
         )
+
+    def test_speech_normalization_expands_standalone_numbers_dates_and_times(self):
+        self.assertEqual(
+            conversation_module._normalize_speech_text(
+                "There are 42 devices. Meeting on 2026-09-04 at 14:30."
+            ),
+            "There are forty-two devices. Meeting on September fourth, twenty twenty-six at two thirty PM.",
+        )
+
+    def test_speech_normalization_preserves_technical_and_math_strings(self):
+        text = "Visit https://example.com/v2/item/42, use light.kitchen_2, IP 192.168.1.10, UUID 550e8400-e29b-41d4-a716-446655440000, version 1.2.3, or calculate 2 + 2."
+        self.assertEqual(conversation_module._normalize_speech_text(text), text)
 
     async def test_entity_streams_safe_deltas_to_chat_log(self):
         entry = FakeConfigEntry(
@@ -657,7 +669,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result.response.speech["plain"]["speech"],
-            "The total is one hundred dollars and 20 percent.",
+            "The total is one hundred dollars and twenty percent.",
         )
         self.assertEqual(
             hass.data["last_chat_log"].content[-1].content,
@@ -686,7 +698,7 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result.response.speech["plain"]["speech"],
-            "The total is one hundred dollars and 20 percent.",
+            "The total is one hundred dollars and twenty percent.",
         )
         self.assertEqual(
             hass.data["last_chat_log"].content[-1].content,
