@@ -247,6 +247,14 @@ def _normalize_speech_text(text: str) -> str:
     if not text:
         return text
 
+    # Preserve leading/trailing whitespace because this helper is also used on
+    # individual streaming chunks. Stripping each chunk joins adjacent words.
+    leading = text[: len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()) :]
+    text = text.strip()
+    if not text:
+        return leading + trailing
+
     def replace_currency(match: re.Match[str]) -> str:
         amount = match.group(1)
         if "." in amount:
@@ -316,7 +324,7 @@ def _normalize_speech_text(text: str) -> str:
     for index, original in enumerate(protected):
         normalized = normalized.replace(f"__HERMES_PROTECTED_{index}__", original)
     normalized = re.sub(r"\s+", " ", normalized)
-    return normalized.strip()
+    return leading + normalized.strip() + trailing
 
 
 def _ordinal_to_words(number: int) -> str:
