@@ -603,6 +603,21 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         text = "Visit https://example.com/v2/item/42, use light.kitchen_2, IP 192.168.1.10, UUID 550e8400-e29b-41d4-a716-446655440000, version 1.2.3, or calculate 2 + 2."
         self.assertEqual(conversation_module._normalize_speech_text(text), text)
 
+    def test_streamed_speech_normalization_preserves_chunk_boundaries(self):
+        speech_filter = conversation_module._UnsafeSpeechStreamFilter(
+            normalize_speech=True
+        )
+
+        spoken = "".join(
+            speech_filter.feed(chunk)
+            for chunk in ["The total is ", "$100 and 20% of it is mine"]
+        ) + speech_filter.flush()
+
+        self.assertEqual(
+            spoken,
+            "The total is one hundred dollars and twenty percent of it is mine",
+        )
+
     async def test_entity_streams_safe_deltas_to_chat_log(self):
         entry = FakeConfigEntry(
             data={CONF_API_KEY: "secret"},
