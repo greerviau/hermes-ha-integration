@@ -473,8 +473,9 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     messages,
                     session_id=session_id,
                 )
+            display_text = _sanitize_text_for_speech(response_text)
             spoken_text = _sanitize_text_for_speech(
-                response_text,
+                display_text,
                 normalize_speech=self._speech_normalization_enabled(),
             )
         except HermesApiError as err:
@@ -496,7 +497,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         if not session_reuse:
             history = self._history.setdefault(conv_id, [])
             history.append({"role": "user", "content": user_input.text})
-            history.append({"role": "assistant", "content": spoken_text})
+            history.append({"role": "assistant", "content": display_text})
             self._history.move_to_end(conv_id)
 
             while len(history) > DEFAULT_MAX_HISTORY_MESSAGES:
@@ -512,7 +513,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         await self._async_speak_fallback(spoken_text, user_input)
         continue_conversation = self._should_continue_conversation(
             follow_up_mode,
-            spoken_text,
+            display_text,
         )
 
         return self._build_conversation_result(
@@ -594,10 +595,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 err,
             )
             result = await self.client.async_send_message(messages, session_id=session_id)
-            if safe_text := _sanitize_text_for_speech(
-                result.text,
-                normalize_speech=self._speech_normalization_enabled(),
-            ):
+            if safe_text := _sanitize_text_for_speech(result.text):
                 yield safe_text
             return
 

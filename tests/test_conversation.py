@@ -18,6 +18,7 @@ from custom_components.hermes_conversation.const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
+    CONF_SPEECH_NORMALIZATION,
     DEFAULT_PROMPT,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
@@ -636,6 +637,61 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", chat_text)
         self.assertNotIn("tool_call", chat_text)
         self.assertNotIn("terminal", chat_text)
+
+    async def test_streaming_keeps_display_text_un_normalized_for_chat_log(self):
+        entry = FakeConfigEntry(
+            data={CONF_API_KEY: "secret"},
+            options={
+                CONF_ENABLE_SESSION_REUSE: True,
+                CONF_PROMPT: "",
+                CONF_SPEECH_NORMALIZATION: True,
+            },
+        )
+        client = FakeClient(stream_chunks=["The total is $100 and 20%."])
+        hass = FakeHass()
+        agent = HermesConversationAgent(hass, entry, client, session_map={})
+
+        result = await agent.async_process(
+            FakeConversationInput("how much", conversation_id="conv-normalized-stream")
+        )
+
+        self.assertEqual(
+            result.response.speech["plain"]["speech"],
+            "The total is one hundred dollars and 20 percent.",
+        )
+        self.assertEqual(
+            hass.data["last_chat_log"].content[-1].content,
+            "The total is $100 and 20%.",
+        )
+
+    async def test_streaming_fallback_keeps_display_text_un_normalized(self):
+        entry = FakeConfigEntry(
+            data={CONF_API_KEY: "secret"},
+            options={
+                CONF_ENABLE_SESSION_REUSE: True,
+                CONF_PROMPT: "",
+                CONF_SPEECH_NORMALIZATION: True,
+            },
+        )
+        client = FakeClient(
+            stream_error=HermesStreamSetupError("stream rejected"),
+            send_text="The total is $100 and 20%.",
+        )
+        hass = FakeHass()
+        agent = HermesConversationAgent(hass, entry, client, session_map={})
+
+        result = await agent.async_process(
+            FakeConversationInput("how much", conversation_id="conv-normalized-fallback")
+        )
+
+        self.assertEqual(
+            result.response.speech["plain"]["speech"],
+            "The total is one hundred dollars and 20 percent.",
+        )
+        self.assertEqual(
+            hass.data["last_chat_log"].content[-1].content,
+            "The total is $100 and 20%.",
+        )
 
     async def test_stream_setup_error_falls_back_to_non_streaming(self):
         entry = FakeConfigEntry(
