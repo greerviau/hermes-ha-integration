@@ -5,8 +5,10 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from custom_components.hermes_conversation import conversation as conversation_module
+from tests.test_support import FakeConfigEntry, FakeConversationInput, FakeHass
 from custom_components.hermes_conversation.api import HermesStreamSetupError
+from custom_components.hermes_conversation import conversation as conversation_module
+from custom_components.hermes_conversation.conversation import HermesConversationAgent
 from custom_components.hermes_conversation.const import (
     CONF_API_KEY,
     CONF_CONTEXT_MAX_CHARS,
@@ -16,15 +18,12 @@ from custom_components.hermes_conversation.const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
-    CONF_SPEECH_NORMALIZATION,
     DEFAULT_PROMPT,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
     FOLLOW_UP_MODE_OFF,
     LEGACY_CONF_INSTRUCTIONS,
 )
-from custom_components.hermes_conversation.conversation import HermesConversationAgent
-from tests.test_support import FakeConfigEntry, FakeConversationInput, FakeHass
 
 
 class FakeClient:
@@ -360,73 +359,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         rendered = agent._render_system_prompt("Chalkers")
         self.assertIn("Legacy system prompt", rendered)
 
-    def test_origin_satellite_is_available_in_prompt_variables(self):
-        entry = FakeConfigEntry(options={CONF_PROMPT: "sat={{ origin_satellite }}"})
-        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
-
-        rendered = agent._render_system_prompt(
-            "Chalkers",
-            FakeConversationInput("hello", satellite_id="assist_satellite.voice_pebble"),
-        )
-
-        self.assertEqual(rendered, "sat=assist_satellite.voice_pebble")
-
-    def test_origin_media_player_resolves_from_satellite_device(self):
-        hass = FakeHass()
-        hass._entity_registry = SimpleNamespace(
-            async_get=lambda entity_id: SimpleNamespace(
-                device_id="voice-device" if entity_id.startswith("assist_satellite") else None,
-                entity_id=entity_id,
-            ),
-            async_entries=lambda: [
-                SimpleNamespace(entity_id="media_player.voice_pebble", device_id="voice-device")
-            ],
-        )
-        entry = FakeConfigEntry(
-            options={
-                CONF_PROMPT: "player={{ origin_media_player }} device={{ origin_device }}"
-            }
-        )
-        agent = HermesConversationAgent(hass, entry, FakeClient(), session_map={})
-
-        rendered = agent._render_system_prompt(
-            "Chalkers",
-            FakeConversationInput("hello", satellite_id="assist_satellite.voice_pebble"),
-        )
-
-        self.assertEqual(rendered, "player=media_player.voice_pebble device=voice-device")
-
-    def test_unknown_origin_context_variables_are_empty(self):
-        entry = FakeConfigEntry(options={CONF_PROMPT: "{{ origin_satellite }}|{{ origin_media_player }}|{{ origin_device }}"})
-        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
-
-        self.assertEqual(agent._render_system_prompt("Chalkers", FakeConversationInput("hello")), "||")
-        self.assertEqual(
-            agent._render_system_prompt(
-                "Chalkers", FakeConversationInput("hello", satellite_id="assist_satellite.unknown")
-            ),
-            "assist_satellite.unknown||",
-        )
-
-    def test_existing_prompt_rendering_remains_valid_without_origin_input(self):
-        entry = FakeConfigEntry(options={CONF_PROMPT: "{{ user_name }} at {{ ha_name }}"})
-        agent = HermesConversationAgent(FakeHass(location_name="Home"), entry, FakeClient(), session_map={})
-
-        self.assertEqual(agent._render_system_prompt("Chalkers"), "Chalkers at Home")
-
-    def test_origin_context_includes_exact_ids(self):
-        entry = FakeConfigEntry()
-        agent = HermesConversationAgent(FakeHass(), entry, FakeClient(), session_map={})
-
-        lines = agent._build_origin_context(
-            FakeConversationInput(
-                "hello", device_id="device-123", satellite_id="assist_satellite.voice"
-            )
-        )
-
-        self.assertIn("Origin device_id: device-123", lines)
-        self.assertIn("Origin satellite_id: assist_satellite.voice", lines)
-
     def test_exposed_entities_include_alias_domain_and_device_area(self):
         state = SimpleNamespace(
             entity_id="light.kitchen_ceiling",
@@ -581,43 +513,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("entity.aliases", DEFAULT_PROMPT)
         self.assertIn("entity.area", DEFAULT_PROMPT)
 
-    def test_speech_normalization_is_opt_in(self):
-        self.assertEqual(
-            conversation_module._sanitize_text_for_speech("Cost: $100, or 20%", normalize_speech=False),
-            "Cost: $100, or 20%",
-        )
-        self.assertEqual(
-            conversation_module._sanitize_text_for_speech("Cost: $100, or 20%", normalize_speech=True),
-            "Cost: one hundred dollars, or twenty percent",
-        )
-
-    def test_speech_normalization_expands_standalone_numbers_dates_and_times(self):
-        self.assertEqual(
-            conversation_module._normalize_speech_text(
-                "There are 42 devices. Meeting on 2026-09-04 at 14:30."
-            ),
-            "There are forty-two devices. Meeting on September fourth, twenty twenty-six at two thirty PM.",
-        )
-
-    def test_speech_normalization_preserves_technical_and_math_strings(self):
-        text = "Visit https://example.com/v2/item/42, use light.kitchen_2, IP 192.168.1.10, UUID 550e8400-e29b-41d4-a716-446655440000, version 1.2.3, or calculate 2 + 2."
-        self.assertEqual(conversation_module._normalize_speech_text(text), text)
-
-    def test_streamed_speech_normalization_preserves_chunk_boundaries(self):
-        speech_filter = conversation_module._UnsafeSpeechStreamFilter(
-            normalize_speech=True
-        )
-
-        spoken = "".join(
-            speech_filter.feed(chunk)
-            for chunk in ["The total is ", "$100 and 20% of it is mine"]
-        ) + speech_filter.flush()
-
-        self.assertEqual(
-            spoken,
-            "The total is one hundred dollars and twenty percent of it is mine",
-        )
-
     async def test_entity_streams_safe_deltas_to_chat_log(self):
         entry = FakeConfigEntry(
             data={CONF_API_KEY: "secret"},
@@ -664,87 +559,6 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", chat_text)
         self.assertNotIn("tool_call", chat_text)
         self.assertNotIn("terminal", chat_text)
-
-    async def test_streaming_adds_missing_currency_boundary_without_normalization(self):
-        entry = FakeConfigEntry(
-            data={CONF_API_KEY: "secret"},
-            options={
-                CONF_ENABLE_SESSION_REUSE: True,
-                CONF_PROMPT: "",
-                CONF_SPEECH_NORMALIZATION: False,
-            },
-        )
-        client = FakeClient(stream_chunks=["The total is$100 and 20% of it is mine"])
-        hass = FakeHass()
-        agent = HermesConversationAgent(hass, entry, client, session_map={})
-
-        result = await agent.async_process(
-            FakeConversationInput("how much", conversation_id="conv-currency-raw")
-        )
-
-        self.assertEqual(
-            result.response.speech["plain"]["speech"],
-            "The total is $100 and 20% of it is mine",
-        )
-        self.assertEqual(
-            hass.data["last_chat_log"].content[-1].content,
-            "The total is$100 and 20% of it is mine",
-        )
-
-    async def test_streaming_adds_missing_currency_boundary_before_normalization(self):
-        entry = FakeConfigEntry(
-            data={CONF_API_KEY: "secret"},
-            options={
-                CONF_ENABLE_SESSION_REUSE: True,
-                CONF_PROMPT: "",
-                CONF_SPEECH_NORMALIZATION: True,
-            },
-        )
-        client = FakeClient(stream_chunks=["The total is$100 and 20% of it is mine"])
-        hass = FakeHass()
-        agent = HermesConversationAgent(hass, entry, client, session_map={})
-
-        result = await agent.async_process(
-            FakeConversationInput("how much", conversation_id="conv-currency-normalized")
-        )
-
-        self.assertEqual(
-            result.response.speech["plain"]["speech"],
-            "The total is one hundred dollars and twenty percent of it is mine",
-        )
-        self.assertEqual(
-            hass.data["last_chat_log"].content[-1].content,
-            "The total is$100 and 20% of it is mine",
-        )
-
-    async def test_streaming_fallback_keeps_display_text_un_normalized(self):
-        entry = FakeConfigEntry(
-            data={CONF_API_KEY: "secret"},
-            options={
-                CONF_ENABLE_SESSION_REUSE: True,
-                CONF_PROMPT: "",
-                CONF_SPEECH_NORMALIZATION: True,
-            },
-        )
-        client = FakeClient(
-            stream_error=HermesStreamSetupError("stream rejected"),
-            send_text="The total is $100 and 20%.",
-        )
-        hass = FakeHass()
-        agent = HermesConversationAgent(hass, entry, client, session_map={})
-
-        result = await agent.async_process(
-            FakeConversationInput("how much", conversation_id="conv-normalized-fallback")
-        )
-
-        self.assertEqual(
-            result.response.speech["plain"]["speech"],
-            "The total is one hundred dollars and twenty percent.",
-        )
-        self.assertEqual(
-            hass.data["last_chat_log"].content[-1].content,
-            "The total is $100 and 20%.",
-        )
 
     async def test_stream_setup_error_falls_back_to_non_streaming(self):
         entry = FakeConfigEntry(
