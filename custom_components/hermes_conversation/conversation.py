@@ -8,16 +8,15 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
-from datetime import date
 from typing import Any
 
 from homeassistant.components.conversation import (
-    MATCH_ALL,
     AbstractConversationAgent,
     ConversationEntity,
     ConversationEntityFeature,
     ConversationInput,
     ConversationResult,
+    MATCH_ALL,
     async_set_agent,
     async_unset_agent,
 )
@@ -31,6 +30,7 @@ from homeassistant.helpers import intent, template
 
 from .api import HermesApiClient, HermesApiError, HermesStreamSetupError
 from .compat import entry_value, resolve_continued_conversation_mode
+from .entity import hermes_device_info
 from .const import (
     CONF_ALWAYS_SPEAK_FALLBACK,
     CONF_API_KEY,
@@ -42,7 +42,6 @@ from .const import (
     CONF_INCLUDE_EXPOSED_ENTITIES,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
-    CONF_SPEECH_NORMALIZATION,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
     DEFAULT_CONTEXT_MAX_CHARS,
     DEFAULT_ENABLE_SESSION_REUSE,
@@ -53,12 +52,12 @@ from .const import (
     DEFAULT_MAX_HISTORY_MESSAGES,
     DEFAULT_PROMPT,
     DEFAULT_SESSION_TIMEOUT_SECONDS,
-    DEFAULT_SPEECH_NORMALIZATION,
     DOMAIN,
     FOLLOW_UP_MODE_ALWAYS,
     FOLLOW_UP_MODE_AUTO,
     LEGACY_CONF_INSTRUCTIONS,
 )
+from .speech import SpeechEmojiFilter, SpeechMarkdownFilter, strip_speech_emoji
 
 try:
     from homeassistant.components.conversation import ChatLog, async_get_chat_log
@@ -72,10 +71,16 @@ _LOGGER = logging.getLogger(__name__)
 _MAX_CACHED_CONVERSATIONS = 50
 _QUESTION_MARKERS = ("?", "\uFF1F")
 _TRAILING_CLOSERS = "\"')]}" + "\u201d\u2019\u00bb"
+_VOICE_SPEECH_PROMPT = (
+    "Your responses are spoken aloud. Use plain, speakable text. "
+    "Do not use emoji, markdown, or decorative formatting. "
+    "Preserve meaningful units, percentages, currencies, and mathematical expressions."
+)
 _AUTO_FOLLOW_UP_PROMPT = (
     "When voice auto follow-up is active and you want the user to reply, "
     "give any needed answer first and end with one short, direct question as "
-    "the final sentence. Do not add any words after the question mark."
+    "the final sentence. End with the question mark, with nothing after the question mark "
+    "(no words, emoji, or decorations)."
 )
 
 _UNSAFE_SPEECH_TAG_PATTERN = (
@@ -99,10 +104,6 @@ _UNSAFE_SPEECH_START_RE = re.compile(
     re.IGNORECASE,
 )
 _MAX_UNSAFE_CLOSE_TAG_LENGTH = 80
-_MONTH_NAMES = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
 
 
 async def async_setup_entry(
@@ -127,10 +128,11 @@ async def async_setup_entry(
 class _UnsafeSpeechStreamFilter:
     """Incrementally drop hidden reasoning and tool markup from streamed speech."""
 
-    def __init__(self, *, normalize_speech: bool = False) -> None:
+    def __init__(self) -> None:
         self._buffer = ""
         self._discard_until_tag: str | None = None
-        self._normalize_speech = normalize_speech
+        self._emoji_filter = SpeechEmojiFilter()
+        self._markdown_filter = SpeechMarkdownFilter()
 
     def feed(self, text: str) -> str:
         """Add a stream delta and return the safe text that can be emitted now."""
@@ -139,8 +141,13 @@ class _UnsafeSpeechStreamFilter:
         self._buffer += text
         return self._drain(final=False)
 
-    def flush(self) -> str:
-        """Return any remaining safe text at end of stream."""
+    def flush(self, *, partial: bool = False) -> str:
+        """Return the safe suffix, without releasing incomplete tags on errors."""
+        if partial:
+            self._buffer = ""
+            self._discard_until_tag = None
+            safe = self._emoji_filter.feed(self._markdown_filter.flush())
+            return safe + self._emoji_filter.flush()
         return self._drain(final=True)
 
     def _drain(self, *, final: bool) -> str:
@@ -190,9 +197,14 @@ class _UnsafeSpeechStreamFilter:
             safe_parts.append(self._consume_safe_buffer(final=final))
             break
 
-        return _sanitize_stream_text_for_speech(
-            "".join(safe_parts), normalize_speech=self._normalize_speech
-        )
+        visible = self._markdown_filter.feed("".join(safe_parts))
+        if final:
+            visible += self._markdown_filter.flush()
+        cleaned = _sanitize_stream_text_for_speech(visible)
+        safe = self._emoji_filter.feed(cleaned)
+        if final:
+            safe += self._emoji_filter.flush()
+        return safe
 
     def _consume_safe_buffer(self, *, final: bool) -> str:
         if final:
@@ -222,167 +234,35 @@ def _remove_unsafe_speech_markup(text: str) -> str:
     return _UNSAFE_SPEECH_TAG_RE.sub("", cleaned)
 
 
-def _sanitize_stream_text_for_speech(
-    text: str, *, normalize_speech: bool = False
-) -> str:
+def _sanitize_stream_text_for_speech(text: str) -> str:
     """Apply safe, local cleanup to a speech stream delta."""
     if not text:
         return text
     cleaned = text.replace("\r\n", "\n")
     cleaned = _remove_unsafe_speech_markup(cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = (
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
+    return (
         cleaned.replace("```", "")
         .replace("`", "")
         .replace("**", "")
         .replace("__", "")
         .replace("~~", "")
     )
-    return _normalize_speech_text(cleaned) if normalize_speech else cleaned
 
 
-def _normalize_speech_text(text: str) -> str:
-    """Expand conservative, common English forms for speech."""
-    if not text:
-        return text
-
-    # Preserve leading/trailing whitespace because this helper is also used on
-    # individual streaming chunks. Stripping each chunk joins adjacent words.
-    leading = text[: len(text) - len(text.lstrip())]
-    trailing = text[len(text.rstrip()) :]
-    text = text.strip()
-    if not text:
-        return leading + trailing
-
-    def replace_currency(match: re.Match[str]) -> str:
-        amount = match.group(1)
-        if "." in amount:
-            dollars, cents = amount.split(".", 1)
-            cents = cents.ljust(2, "0")
-            return (
-                f"{_number_to_words(int(dollars))} dollars and "
-                f"{_number_to_words(int(cents))} cents"
-            )
-        return f"{_number_to_words(int(amount))} dollars"
-
-    normalized = re.sub(r"\$(\d+(?:\.\d{1,2})?)", replace_currency, text)
-    normalized = re.sub(r"(?<=\d)%", " percent", normalized)
-    normalized = normalized.replace("≈", "approximately")
-    normalized = normalized.replace("&", " and ")
-
-    def replace_date(match: re.Match[str]) -> str:
-        year, month, day = (int(part) for part in match.groups())
-        try:
-            date(year, month, day)
-        except ValueError:
-            return match.group(0)
-        return f"{_MONTH_NAMES[month - 1]} {_ordinal_to_words(day)}, {_year_to_words(year)}"
-
-    # Handle dates before protecting subtraction expressions (the date hyphens
-    # must not be mistaken for minus signs).
-    normalized = re.sub(r"\b(\d{4})-(\d{2})-(\d{2})\b", replace_date, normalized)
-
-    # Do not alter identifiers, URLs, IPs, UUIDs, versions, or arithmetic.
-    protected: list[str] = []
-
-    def protect(match: re.Match[str]) -> str:
-        protected.append(match.group(0))
-        return f"__HERMES_PROTECTED_{len(protected) - 1}__"
-
-    normalized = re.sub(
-        r"(?:https?://|www\.)\S+|\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b[A-Za-z_][\w.-]*\d[\w.-]*\b|(?<!\w)\d+(?:\s*[+*/-]\s*\d+)+(?!\w)",
-        protect,
-        normalized,
-        flags=re.IGNORECASE,
-    )
-
-    def replace_time(match: re.Match[str]) -> str:
-        hour, minute = (int(part) for part in match.groups())
-        if hour > 23 or minute > 59:
-            return match.group(0)
-        if hour == 0 and minute == 0:
-            return "midnight"
-        if hour == 12 and minute == 0:
-            return "noon"
-        suffix = "AM" if hour < 12 else "PM"
-        spoken_hour = _number_to_words(hour % 12 or 12)
-        if minute == 0:
-            spoken_minute = ""
-        elif minute < 10:
-            spoken_minute = f"oh {_number_to_words(minute)}"
-        else:
-            spoken_minute = _number_to_words(minute)
-        return f"{spoken_hour}{f' {spoken_minute}' if spoken_minute else ''} {suffix}"
-
-    normalized = re.sub(r"\b(\d{1,2}):(\d{2})\b", replace_time, normalized)
-    normalized = re.sub(
-        r"(?<![\w.])(\d{1,3}(?:,\d{3})*|\d+)(?![\w.])",
-        lambda match: _number_to_words(int(match.group(1).replace(",", ""))),
-        normalized,
-    )
-    for index, original in enumerate(protected):
-        normalized = normalized.replace(f"__HERMES_PROTECTED_{index}__", original)
-    normalized = re.sub(r"\s+", " ", normalized)
-    return leading + normalized.strip() + trailing
-
-
-def _ordinal_to_words(number: int) -> str:
-    """Convert the day of a month to a short English ordinal."""
-    irregular = {
-        1: "first", 2: "second", 3: "third", 5: "fifth", 8: "eighth",
-        9: "ninth", 12: "twelfth",
-    }
-    if number in irregular:
-        return irregular[number]
-    if 10 < number < 14:
-        return f"{_number_to_words(number)}th"
-    suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
-    return f"{_number_to_words(number)}{suffix}"
-
-
-def _year_to_words(year: int) -> str:
-    """Speak a four-digit year in its usual conversational form."""
-    if 1000 <= year <= 2099:
-        return f"{_number_to_words(year // 100)} {_number_to_words(year % 100)}" if year % 100 else _number_to_words(year // 100) + " hundred"
-    return _number_to_words(year)
-
-
-def _number_to_words(number: int) -> str:
-    """Convert a non-negative integer into concise English words."""
-    ones = (
-        "zero", "one", "two", "three", "four", "five", "six", "seven",
-        "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
-        "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
-    )
-    tens = ("", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety")
-    if number < 20:
-        return ones[number]
-    if number < 100:
-        return tens[number // 10] + (f"-{ones[number % 10]}" if number % 10 else "")
-    if number < 1000:
-        remainder = number % 100
-        return f"{ones[number // 100]} hundred" + (f" {_number_to_words(remainder)}" if remainder else "")
-    for scale, name in ((1_000_000, "million"), (1_000, "thousand")):
-        if number >= scale:
-            remainder = number % scale
-            return f"{_number_to_words(number // scale)} {name}" + (f" {_number_to_words(remainder)}" if remainder else "")
-    return str(number)
-
-
-def _sanitize_text_for_speech(
-    text: str, *, normalize_speech: bool = False
-) -> str:
+def _sanitize_text_for_speech(text: str) -> str:
     """Convert markdown-ish assistant output into plain speech-friendly text."""
     if not text:
         return text
 
     cleaned = text.replace("\r\n", "\n")
     cleaned = _remove_unsafe_speech_markup(cleaned)
+    cleaned = strip_speech_emoji(cleaned)
     cleaned = re.sub(r"```(?:[\w+-]+)?\n?(.*?)```", r"\1", cleaned, flags=re.DOTALL)
     cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
-    cleaned = re.sub(r"!\[([^\]]*)\]\([^\)]+\)", r"\1", cleaned)
-    cleaned = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", cleaned)
+    markdown_filter = SpeechMarkdownFilter()
+    cleaned = markdown_filter.feed(cleaned) + markdown_filter.flush()
     cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^>+\s*", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"^\s*[-*+]\s+", "", cleaned, flags=re.MULTILINE)
@@ -392,13 +272,10 @@ def _sanitize_text_for_speech(
     cleaned = re.sub(r"(?<!_)_(?!\s)(.*?)(?<!\s)_(?!_)", r"\1", cleaned)
     cleaned = re.sub(r"~~(.*?)~~", r"\1", cleaned)
     cleaned = re.sub(r"\[(.*?)\]\[[^\]]*\]", r"\1", cleaned)
-    # Restore a readable boundary when the response joins a word to currency.
-    cleaned = re.sub(r"(?<=[A-Za-z])\$(?=\d)", " $", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\s+([,.!?;:])", r"\1", cleaned)
-    cleaned = cleaned.strip()
-    return _normalize_speech_text(cleaned) if normalize_speech else cleaned
+    return cleaned.strip()
 
 
 class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
@@ -421,6 +298,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self.session_map = session_map
         self._attr_unique_id = entry.entry_id
         self._attr_name = getattr(entry, "title", None) or "Hermes Agent"
+        self._attr_device_info = hermes_device_info(entry)
         self._attr_supported_features = ConversationEntityFeature.CONTROL
         # conversation_id -> list of {"role": ..., "content": ...}
         self._history: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
@@ -521,7 +399,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         user_name = await self._get_user_name(user_input)
 
         # Build system prompt (optional — Hermes Agent has its own)
-        system_prompt = self._render_system_prompt(user_name, user_input)
+        system_prompt = self._render_system_prompt(user_name)
 
         # Append extra system prompt from HA voice pipeline if present
         extra = getattr(user_input, "extra_system_prompt", None)
@@ -535,6 +413,11 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 origin_block = "Origin context:\n" + "\n".join(f"- {line}" for line in context_lines)
                 system_prompt = (system_prompt + "\n\n" + origin_block) if system_prompt else origin_block
 
+        # Every response enters HA speech, even without device-origin metadata.
+        system_prompt = (
+            f"{system_prompt}\n\n{_VOICE_SPEECH_PROMPT}"
+            if system_prompt else _VOICE_SPEECH_PROMPT
+        )
         system_prompt = self._append_auto_follow_up_prompt(
             system_prompt,
             follow_up_mode,
@@ -562,11 +445,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     messages,
                     session_id=session_id,
                 )
-            display_text = _sanitize_text_for_speech(response_text)
-            spoken_text = _sanitize_text_for_speech(
-                display_text,
-                normalize_speech=self._speech_normalization_enabled(),
-            )
+            spoken_text = _sanitize_text_for_speech(response_text)
         except HermesApiError as err:
             _LOGGER.error("Hermes API error: %s", err)
             intent_response = intent.IntentResponse(language=user_input.language)
@@ -586,7 +465,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         if not session_reuse:
             history = self._history.setdefault(conv_id, [])
             history.append({"role": "user", "content": user_input.text})
-            history.append({"role": "assistant", "content": display_text})
+            history.append({"role": "assistant", "content": spoken_text})
             self._history.move_to_end(conv_id)
 
             while len(history) > DEFAULT_MAX_HISTORY_MESSAGES:
@@ -602,7 +481,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         await self._async_speak_fallback(spoken_text, user_input)
         continue_conversation = self._should_continue_conversation(
             follow_up_mode,
-            display_text,
+            spoken_text,
         )
 
         return self._build_conversation_result(
@@ -664,8 +543,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         session_id: str | None = None,
     ) -> AsyncIterator[str]:
         """Yield speech-safe assistant text chunks from Hermes streaming."""
-        # Normalize only after the complete response is assembled. Applying
-        # it to individual stream chunks strips their boundary whitespace.
         speech_filter = _UnsafeSpeechStreamFilter()
         stream_started = False
 
@@ -676,8 +553,12 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                 stream_started = True
                 if safe_chunk := speech_filter.feed(chunk):
                     yield safe_chunk
-        except HermesStreamSetupError as err:
-            if stream_started:
+        except HermesApiError as err:
+            if stream_started or not isinstance(err, HermesStreamSetupError):
+                # Preserve a pending plain digit/symbol in a partial response,
+                # but never flush unfinished reasoning/tool markup on failure.
+                if safe_tail := speech_filter.flush(partial=True):
+                    yield safe_tail
                 raise
             _LOGGER.debug(
                 "Hermes streaming setup failed; falling back to non-streaming: %s",
@@ -694,16 +575,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
     def _agent_id(self) -> str:
         """Return the best available Home Assistant agent identifier."""
         return getattr(self, "entity_id", None) or self.entry.entry_id
-
-    def _speech_normalization_enabled(self) -> bool:
-        """Return whether optional speech symbol normalization is enabled."""
-        return bool(
-            entry_value(
-                self.entry,
-                CONF_SPEECH_NORMALIZATION,
-                DEFAULT_SPEECH_NORMALIZATION,
-            )
-        )
 
     async def _get_response(
         self,
@@ -746,11 +617,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             _LOGGER.debug("Could not resolve username", exc_info=True)
         return "the user"
 
-    def _render_system_prompt(
-        self,
-        user_name: str,
-        user_input: ConversationInput | None = None,
-    ) -> str:
+    def _render_system_prompt(self, user_name: str) -> str:
         """Render the system prompt template with HA context."""
         prompt_template = entry_value(
             self.entry,
@@ -764,7 +631,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         variables: dict[str, Any] = {
             "ha_name": self.hass.config.location_name,
             "user_name": user_name,
-            **self._get_origin_prompt_variables(user_input),
         }
 
         include_entities = entry_value(
@@ -797,59 +663,6 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             return f"{system_prompt}\n\n{_AUTO_FOLLOW_UP_PROMPT}"
 
         return _AUTO_FOLLOW_UP_PROMPT
-
-    def _get_origin_prompt_variables(
-        self, user_input: ConversationInput | None
-    ) -> dict[str, str]:
-        """Return exact origin IDs and a paired media player, when available."""
-        if user_input is None:
-            return {
-                "origin_satellite": "",
-                "origin_media_player": "",
-                "origin_device": "",
-            }
-
-        satellite_id = getattr(user_input, "satellite_id", None) or ""
-        device_id = getattr(user_input, "device_id", None) or ""
-        entity_reg = er.async_get(self.hass)
-
-        # A satellite is normally an entity whose registry entry points to its device.
-        if not device_id and satellite_id:
-            try:
-                satellite_entry = entity_reg.async_get(satellite_id)
-            except (AttributeError, TypeError, ValueError):
-                satellite_entry = None
-            device_id = getattr(satellite_entry, "device_id", None) or ""
-
-        media_player = ""
-        if device_id:
-            entries: Any = ()
-            try:
-                entries_for_device = getattr(entity_reg, "async_entries_for_device", None)
-                if callable(entries_for_device):
-                    entries = entries_for_device(device_id)
-                else:
-                    entries = entity_reg.async_entries()
-            except (AttributeError, TypeError, ValueError):
-                entries = ()
-            for entity_entry in entries:
-                entity_id = getattr(entity_entry, "entity_id", "") or ""
-                domain = (
-                    getattr(entity_entry, "domain", None)
-                    or entity_id.partition(".")[0]
-                )
-                if (
-                    domain == "media_player"
-                    and getattr(entity_entry, "device_id", None) == device_id
-                ):
-                    media_player = entity_id
-                    break
-
-        return {
-            "origin_satellite": satellite_id,
-            "origin_media_player": media_player,
-            "origin_device": device_id,
-        }
 
     def _get_exposed_entities(self) -> list[dict[str, Any]]:
         """Get a list of entities exposed to the conversation agent."""
@@ -1038,15 +851,8 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             lines.append(f"Language: {language}")
         if device_id:
             lines.extend(self._describe_device(device_id))
-            lines.append(f"Origin device_id: {device_id}")
         if satellite_id:
             lines.extend(self._describe_satellite(satellite_id))
-            lines.append(f"Origin satellite_id: {satellite_id}")
-        media_player = self._get_origin_prompt_variables(user_input)[
-            "origin_media_player"
-        ]
-        if media_player:
-            lines.append(f"Origin media_player: {media_player}")
         return lines
 
     def _describe_device(self, device_id: str) -> list[str]:
