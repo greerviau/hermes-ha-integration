@@ -612,12 +612,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(parts, ["Safe answer"])
 
-    async def test_streaming_ignores_tool_call_deltas(self):
+    async def test_streaming_discards_tool_turn_content_before_final_answer(self):
         chunks = [
             "data: "
             + json.dumps({"choices": [{"delta": {"tool_calls": [{"id": "call-1"}]}}]})
             + "\n",
             "data: " + json.dumps({"choices": [{"delta": {"content": "Done"}}]}) + "\n",
+            "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}) + "\n",
+            "data: " + json.dumps({"choices": [{"delta": {"content": "The weather is sunny."}}]}) + "\n",
             "data: [DONE]\n",
         ]
         session = FakeSession([FakeResponse(chunks=chunks)])
@@ -625,11 +627,11 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         parts = []
         async for part in client.async_stream_message(
-            [{"role": "user", "content": "hi"}]
+            [{"role": "user", "content": "what is the weather?"}]
         ):
             parts.append(part)
 
-        self.assertEqual(parts, ["Done"])
+        self.assertEqual(parts, ["The weather is sunny."])
 
     async def test_streaming_rejected_status_raises_setup_error(self):
         session = FakeSession([FakeResponse(status=400, text_data="stream unsupported")])

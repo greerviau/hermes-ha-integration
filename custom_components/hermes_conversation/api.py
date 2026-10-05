@@ -330,9 +330,12 @@ class HermesApiClient:
 
                 self._last_session_id = resp.headers.get("X-Hermes-Session-Id") or session_id
 
-                # Parse SSE stream
+                # A tool-call turn may contain an assistant acknowledgement (for
+                # example, ``Done``) before the API emits finish_reason=tool_calls.
+                # That text is not the final answer and must not be sent to TTS.
                 buffer = ""
                 event_name = "message"
+                in_tool_call_turn = False
                 async for chunk in resp.content.iter_any():
                     buffer += chunk.decode("utf-8", errors="replace")
                     while "\n" in buffer:
@@ -357,11 +360,16 @@ class HermesApiClient:
 
                         try:
                             data = json.loads(line[6:])
-                            delta = (
-                                data.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content")
-                            )
+                            choice = data.get("choices", [{}])[0]
+                            delta_data = choice.get("delta", {})
+                            if delta_data.get("tool_calls"):
+                                in_tool_call_turn = True
+                            if choice.get("finish_reason") == "tool_calls":
+                                in_tool_call_turn = False
+                                continue
+                            delta = delta_data.get("content")
+                            if in_tool_call_turn:
+                                continue
                             if isinstance(delta, str) and delta:
                                 yield delta
                         except (json.JSONDecodeError, IndexError):
